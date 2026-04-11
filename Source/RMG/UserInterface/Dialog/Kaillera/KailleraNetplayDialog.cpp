@@ -3467,19 +3467,12 @@ void KailleraNetplayDialog::onConnectServer()
     // Initialize kaillera core for server mode
     if (kaillera_core_initialize(0, APP, usernameBytes.data(), 1))
     {
-        const bool stateTimerWasRunning =
-            (m_stateMachineTimer != nullptr && m_stateMachineTimer->isActive());
-
-        // IMPORTANT: pause the n02 state-machine timer while connect runs on a
-        // worker thread. Both paths touch shared socket globals inside n02, and
-        // running them concurrently can corrupt state and crash on teardown.
-        if (stateTimerWasRunning)
-        {
-            m_stateMachineTimer->stop();
-        }
-
-        // Run connect on a background thread so the UI stays responsive
-        // (kaillera_core_connect blocks for up to 15 seconds on timeout)
+        // Keep the state machine timer running during connect so that
+        // kaillera_step() can immediately respond to SERVPING for the
+        // server's speed test. The connect function uses a separate local
+        // socket for the HELLO handshake and only touches KAILLERAC.connection
+        // briefly to set the address, so there's no conflict with
+        // kaillera_step() which checks connection != null at entry.
         auto connectFuture = std::async(std::launch::async, [&]() {
             return kaillera_core_connect(ipBytes.data(), port);
         });
@@ -3501,20 +3494,12 @@ void KailleraNetplayDialog::onConnectServer()
                 while (connectFuture.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready)
                     QApplication::processEvents();
                 kaillera_core_cleanup();
-                if (stateTimerWasRunning && m_stateMachineTimer != nullptr)
-                {
-                    m_stateMachineTimer->start(1);
-                }
                 return;
             }
         }
         progress.close();
 
         const bool connected = connectFuture.get();
-        if (stateTimerWasRunning && m_stateMachineTimer != nullptr)
-        {
-            m_stateMachineTimer->start(1);
-        }
 
         if (connected)
         {
