@@ -77,6 +77,7 @@ static constexpr int kMaxP2PRecentEntries = 12;
 namespace {
 
 static constexpr int kMaxTraversalDigits = 3;
+static constexpr int kConnectPollIntervalMs = 1;
 
 int parseStoredPingValue(const QString& storedPingText, const QString& storedPingValueText)
 {
@@ -3485,13 +3486,13 @@ void KailleraNetplayDialog::onConnectServer()
         progress.show();
 
         // Poll until the future completes or user cancels
-        while (connectFuture.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready)
+        while (connectFuture.wait_for(std::chrono::milliseconds(kConnectPollIntervalMs)) != std::future_status::ready)
         {
             QApplication::processEvents();
             if (progress.wasCanceled())
             {
                 // Can't cancel the blocking socket wait, so keep processing events until it finishes
-                while (connectFuture.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready)
+                while (connectFuture.wait_for(std::chrono::milliseconds(kConnectPollIntervalMs)) != std::future_status::ready)
                     QApplication::processEvents();
                 kaillera_core_cleanup();
                 return;
