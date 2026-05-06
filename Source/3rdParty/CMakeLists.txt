@@ -233,6 +233,25 @@ set(IMGUI_SOURCES
 add_library(imgui STATIC ${IMGUI_SOURCES})
 target_include_directories(imgui PRIVATE ${IMGUI_DIR})
 
+# Frame Zero — pull in GekkoNet (rollback netcode SDK) as a static library.
+# We use the bundled ASIO transport so we don't need extra system deps.
+# The library carries its own CMakeLists at GekkoLib/CMakeLists.txt.
+if (FRAME_ZERO)
+    set(GEKKONET_DIR ${CMAKE_CURRENT_SOURCE_DIR}/gekkonet)
+    if (EXISTS ${GEKKONET_DIR}/CMakeLists.txt)
+        # Force static, ASIO-included; hide GekkoNet's internal options from
+        # the parent project to avoid surprising the wider build.
+        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+        set(NO_ASIO_BUILD OFF CACHE BOOL "" FORCE)
+        set(BUILD_DOCS OFF CACHE BOOL "" FORCE)
+        add_subdirectory(${GEKKONET_DIR})
+    else()
+        message(WARNING
+            "FRAME_ZERO=ON but GekkoNet submodule is missing at ${GEKKONET_DIR}. "
+            "Run: git submodule update --init Source/3rdParty/gekkonet")
+    endif()
+endif()
+
 set(SDL_GAMECONTROLLERDB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/SDL_GameControllerDB)
 set(SDL_GAMECONTROLLERDB_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/SDL_GameControllerDB)
 set(SDL_GAMECONTROLLERDB_SOURCES_IN

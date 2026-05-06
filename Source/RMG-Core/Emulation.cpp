@@ -1070,6 +1070,18 @@ static void apply_kaillera_deterministic_settings(void)
     // This prevents desync from players having different in-game settings saved
     CoreSettingsSetValue(SettingsID::Core_DisableSaveFileLoading, true);
 }
+
+// Force deterministic settings for a Frame Zero (rollback) session.
+// Rollback's correctness gate is stricter than Kaillera's: lockstep only
+// requires "same inputs from frame 0 → same state", whereas rollback
+// requires "any saved state, replayed from any point, → same result."
+// In practice the baseline is identical to Kaillera's — randomness off,
+// dynarec, no save-file influence — and we share it. If Frame Zero ever
+// needs *additional* gates beyond what Kaillera tolerates, add them here.
+static void apply_frame_zero_deterministic_settings(void)
+{
+    apply_kaillera_deterministic_settings();
+}
 #endif
 
 static void apply_pif_rom_settings(void)

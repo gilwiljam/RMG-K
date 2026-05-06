@@ -39,6 +39,7 @@ set(RMG_CORE_SOURCES
     Library.cpp
     Netplay.cpp
     Kaillera.cpp
+    FrameZero.cpp
     FrameZeroState.cpp
     Plugins.cpp
     Version.cpp
@@ -57,6 +58,10 @@ set(RMG_CORE_SOURCES
 if (NETPLAY)
     add_definitions(-DNETPLAY)
 endif(NETPLAY)
+
+if (FRAME_ZERO)
+    add_definitions(-DFRAME_ZERO)
+endif(FRAME_ZERO)
 
 if (PORTABLE_INSTALL)
     add_definitions(-DPORTABLE_INSTALL)
@@ -89,6 +94,12 @@ if (NETPLAY AND WIN32)
         ${CMAKE_CURRENT_SOURCE_DIR}/../n02
     )
     target_link_options(RMG-Core PRIVATE -Wl,--export-all-symbols)
+endif()
+
+# Frame Zero — link GekkoNet (static, includes its own ASIO transport).
+# PRIVATE so GekkoNet symbols don't bleed into RMG.exe's link.
+if (FRAME_ZERO AND TARGET GekkoNet)
+    target_link_libraries(RMG-Core PRIVATE GekkoNet)
 endif()
 
 target_include_directories(RMG-Core PRIVATE 
