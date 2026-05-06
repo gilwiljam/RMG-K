@@ -26,7 +26,7 @@
 #include "backends/api/rumble_backend.h"
 #include "plugin/plugin.h"
 
-#include "main/main.h"
+#include "main/main.h"  /* for g_FrameZero_NeutralizeInput */
 #include "main/netplay.h"
 
 #include <stdint.h>
@@ -83,6 +83,17 @@ static m64p_error input_plugin_get_input(void* opaque, uint32_t* input_)
         }
         cin_compat->last_input = keys.Value; //disable pak switching for netplay
         cin_compat->last_pak_type = Controls[cin_compat->control_id].Plugin; //disable pak switching for netplay
+    }
+
+    /* Frame Zero: when the determinism test is in an "advance" phase, force
+     * all controller inputs to neutral so the user pressing buttons during
+     * the test does not cause leg1 vs leg2 input divergence. We also clobber
+     * last_input so pak-switch edge detection doesn't fire spuriously when
+     * neutralize toggles off. */
+    if (g_FrameZero_NeutralizeInput)
+    {
+        keys.Value = 0;
+        cin_compat->last_input = 0;
     }
 
     /* return an error if controller is not plugged */

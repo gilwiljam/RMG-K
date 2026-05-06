@@ -73,7 +73,7 @@ enum { GB_CART_FINGERPRINT_OFFSET = 0x134 };
 enum { DD_DISK_ID_OFFSET = 0x43670 };
 
 static const char* savestate_magic = "M64+SAVE";
-static const int savestate_latest_version = 0x00020000;  /* 2.0 */
+static const int savestate_latest_version = 0x00020200;  /* 2.2 — cp0.last_addr (Frame Zero CP0 cycle accounting fix) */
 static const unsigned char pj64_magic[4] = { 0xC8, 0xA6, 0xD8, 0x23 };
 
 static savestates_job job = savestates_job_nothing;
@@ -204,10 +204,15 @@ static void savestates_clear_job(void)
 #define PUTDATA(buff, type, value) \
     do { type x = value; PUTARRAY(&x, buff, type, 1); } while(0)
 
-static int savestates_load_m64p(struct device* dev, char *filepath)
+/* Loads an m64p savestate. Two modes:
+ *   - File mode (filepath != NULL): existing behaviour, opens & reads gz file.
+ *   - Buffer mode (in_buf != NULL): used by Frame Zero rollback. Skips MD5
+ *     check; caller is responsible for ensuring same ROM. */
+static int savestates_load_m64p(struct device* dev, char *filepath,
+                                 const uint8_t* in_buf, size_t in_len)
 {
     unsigned char header[44];
-    gzFile f;
+    gzFile f = NULL;
     unsigned int version;
     int i;
     uint32_t FCR31;
@@ -217,111 +222,199 @@ static int savestates_load_m64p(struct device* dev, char *filepath)
     char queue[1024];
     unsigned char using_tlb_data[4];
     unsigned char data_0001_0200[4096]; // 4k for extra state from v1.2
+    int buffer_mode = (in_buf != NULL);
+    int owns_savestate_data = 0;
 
     uint32_t* cp0_regs = r4300_cp0_regs(&dev->r4300.cp0);
 
-    SDL_LockMutex(savestates_lock);
+    if (buffer_mode)
+    {
+        /* Buffer-mode header validation. Standard layout:
+         * 44 byte header (8 magic + 4 version + 32 MD5) +
+         * 16,788,244 byte body + 1024 queue + 4 using_tlb + 4096 extra.
+         * Optional Frame Zero plugin-state extension may follow. */
+        const size_t expected_len = 44 + 16788244 + sizeof(queue)
+                                   + sizeof(using_tlb_data) + sizeof(data_0001_0200);
+        if (in_len < expected_len)
+            return 0;
 
-    f = osal_gzopen(filepath, "rb");
-    if(f==NULL)
-    {
-        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not open state file: %s", filepath);
-        SDL_UnlockMutex(savestates_lock);
-        return 0;
-    }
+        memcpy(header, in_buf, 44);
+        curr = header;
 
-    /* Read and check Mupen64Plus magic number. */
-    if (gzread(f, header, 44) != 44)
-    {
-        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read header from state file %s", filepath);
-        gzclose(f);
-        SDL_UnlockMutex(savestates_lock);
-        return 0;
-    }
-    curr = header;
+        if (strncmp((char*)curr, savestate_magic, 8) != 0)
+            return 0;
+        curr += 8;
 
-    if(strncmp((char *)curr, savestate_magic, 8)!=0)
-    {
-        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State file: %s is not a valid Mupen64plus savestate.", filepath);
-        gzclose(f);
-        SDL_UnlockMutex(savestates_lock);
-        return 0;
-    }
-    curr += 8;
+        version = *curr++;
+        version = (version << 8) | *curr++;
+        version = (version << 8) | *curr++;
+        version = (version << 8) | *curr++;
+        if ((version >> 16) != (savestate_latest_version >> 16))
+            return 0;
+        /* Skip MD5 check in buffer mode — Frame Zero ensures same ROM. */
+        curr += 32;
 
-    version = *curr++;
-    version = (version << 8) | *curr++;
-    version = (version << 8) | *curr++;
-    version = (version << 8) | *curr++;
-    if((version >> 16) != (savestate_latest_version >> 16))
-    {
-        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State version (%08x) isn't compatible. Please update Mupen64Plus.", version);
-        gzclose(f);
-        SDL_UnlockMutex(savestates_lock);
-        return 0;
-    }
+        /* Slice buffer regions. Frame Zero is x64 (little-endian), so the
+         * to_little_endian_buffer no-op means parse macros don't mutate
+         * the input buffer. We cast away const for that reason. */
+        savestateSize = 16788244;
+        savestateData = curr = (unsigned char*)(uintptr_t)(in_buf + 44);
+        memcpy(queue, in_buf + 44 + savestateSize, sizeof(queue));
+        memcpy(using_tlb_data, in_buf + 44 + savestateSize + sizeof(queue),
+               sizeof(using_tlb_data));
+        memcpy(data_0001_0200,
+               in_buf + 44 + savestateSize + sizeof(queue) + sizeof(using_tlb_data),
+               sizeof(data_0001_0200));
+        owns_savestate_data = 0;
 
-    if(memcmp((char *)curr, ROM_SETTINGS.MD5, 32))
-    {
-        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State ROM MD5 does not match current ROM.");
-        gzclose(f);
-        SDL_UnlockMutex(savestates_lock);
-        return 0;
+        /* Frame Zero RSP plugin state extension. Optional trailer:
+         *   magic[4]="RSP1" + len[4 LE] + payload[len].
+         * If present and the loaded RSP plugin supports it, restore the
+         * plugin's internal audio mixer state. */
+        if (rsp.loadState && in_len >= expected_len + 8) {
+            const uint8_t* ext = in_buf + expected_len;
+            if (memcmp(ext, "RSP1", 4) == 0) {
+                uint32_t plen = (uint32_t)ext[4]
+                              | ((uint32_t)ext[5] << 8)
+                              | ((uint32_t)ext[6] << 16)
+                              | ((uint32_t)ext[7] << 24);
+                if (in_len >= expected_len + 8 + plen) {
+                    rsp.loadState(ext + 8, plen);
+                }
+            }
+        }
     }
-    curr += 32;
+    else
+    {
+        SDL_LockMutex(savestates_lock);
 
-    /* Read the rest of the savestate */
-    savestateSize = 16788244;
-    savestateData = curr = (unsigned char *)malloc(savestateSize);
-    if (savestateData == NULL)
-    {
-        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to load state.");
-        gzclose(f);
-        SDL_UnlockMutex(savestates_lock);
-        return 0;
-    }
-    if (version == 0x00010000) /* original savestate version */
-    {
-        if (gzread(f, savestateData, savestateSize) != (int)savestateSize ||
-            (gzread(f, queue, sizeof(queue)) % 4) != 0)
+        f = osal_gzopen(filepath, "rb");
+        if(f==NULL)
         {
-            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read Mupen64Plus savestate 1.0 data from %s", filepath);
-            free(savestateData);
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not open state file: %s", filepath);
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+
+        /* Read and check Mupen64Plus magic number. */
+        if (gzread(f, header, 44) != 44)
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read header from state file %s", filepath);
             gzclose(f);
             SDL_UnlockMutex(savestates_lock);
             return 0;
         }
-    }
-    else if (version == 0x00010100) // saves entire eventqueue plus 4-byte using_tlb flags
-    {
-        if (gzread(f, savestateData, savestateSize) != (int)savestateSize ||
-            gzread(f, queue, sizeof(queue)) != sizeof(queue) ||
-            gzread(f, using_tlb_data, sizeof(using_tlb_data)) != sizeof(using_tlb_data))
-        {
-            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read Mupen64Plus savestate 1.1 data from %s", filepath);
-            free(savestateData);
-            gzclose(f);
-            SDL_UnlockMutex(savestates_lock);
-            return 0;
-        }
-    }
-    else // version >= 0x00010200  saves entire eventqueue, 4-byte using_tlb flags and extra state
-    {
-        if (gzread(f, savestateData, savestateSize) != (int)savestateSize ||
-            gzread(f, queue, sizeof(queue)) != sizeof(queue) ||
-            gzread(f, using_tlb_data, sizeof(using_tlb_data)) != sizeof(using_tlb_data) ||
-            gzread(f, data_0001_0200, sizeof(data_0001_0200)) != sizeof(data_0001_0200))
-        {
-            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read Mupen64Plus savestate 1.2+ data from %s", filepath);
-            free(savestateData);
-            gzclose(f);
-            SDL_UnlockMutex(savestates_lock);
-            return 0;
-        }
-    }
+        curr = header;
 
-    gzclose(f);
-    SDL_UnlockMutex(savestates_lock);
+        if(strncmp((char *)curr, savestate_magic, 8)!=0)
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State file: %s is not a valid Mupen64plus savestate.", filepath);
+            gzclose(f);
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+        curr += 8;
+
+        version = *curr++;
+        version = (version << 8) | *curr++;
+        version = (version << 8) | *curr++;
+        version = (version << 8) | *curr++;
+        if((version >> 16) != (savestate_latest_version >> 16))
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State version (%08x) isn't compatible. Please update Mupen64Plus.", version);
+            gzclose(f);
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+
+        if(memcmp((char *)curr, ROM_SETTINGS.MD5, 32))
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State ROM MD5 does not match current ROM.");
+            gzclose(f);
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+        curr += 32;
+
+        /* Read the rest of the savestate */
+        savestateSize = 16788244;
+        savestateData = curr = (unsigned char *)malloc(savestateSize);
+        if (savestateData == NULL)
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to load state.");
+            gzclose(f);
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+        owns_savestate_data = 1;
+        if (version == 0x00010000) /* original savestate version */
+        {
+            if (gzread(f, savestateData, savestateSize) != (int)savestateSize ||
+                (gzread(f, queue, sizeof(queue)) % 4) != 0)
+            {
+                main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read Mupen64Plus savestate 1.0 data from %s", filepath);
+                free(savestateData);
+                gzclose(f);
+                SDL_UnlockMutex(savestates_lock);
+                return 0;
+            }
+        }
+        else if (version == 0x00010100) // saves entire eventqueue plus 4-byte using_tlb flags
+        {
+            if (gzread(f, savestateData, savestateSize) != (int)savestateSize ||
+                gzread(f, queue, sizeof(queue)) != sizeof(queue) ||
+                gzread(f, using_tlb_data, sizeof(using_tlb_data)) != sizeof(using_tlb_data))
+            {
+                main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read Mupen64Plus savestate 1.1 data from %s", filepath);
+                free(savestateData);
+                gzclose(f);
+                SDL_UnlockMutex(savestates_lock);
+                return 0;
+            }
+        }
+        else // version >= 0x00010200  saves entire eventqueue, 4-byte using_tlb flags and extra state
+        {
+            if (gzread(f, savestateData, savestateSize) != (int)savestateSize ||
+                gzread(f, queue, sizeof(queue)) != sizeof(queue) ||
+                gzread(f, using_tlb_data, sizeof(using_tlb_data)) != sizeof(using_tlb_data) ||
+                gzread(f, data_0001_0200, sizeof(data_0001_0200)) != sizeof(data_0001_0200))
+            {
+                main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read Mupen64Plus savestate 1.2+ data from %s", filepath);
+                free(savestateData);
+                gzclose(f);
+                SDL_UnlockMutex(savestates_lock);
+                return 0;
+            }
+        }
+
+        /* Frame Zero RSP plugin-state extension (optional trailer). Read
+         * a 4-byte magic. If it matches "RSP1", read the length and
+         * payload and apply via the loaded RSP plugin. Missing extension
+         * is fine — savestate just loads without plugin-internal state. */
+        if (rsp.loadState) {
+            unsigned char ext_hdr[8];
+            int hdr_read = gzread(f, ext_hdr, sizeof(ext_hdr));
+            if (hdr_read == (int)sizeof(ext_hdr) &&
+                memcmp(ext_hdr, "RSP1", 4) == 0) {
+                uint32_t plen = (uint32_t)ext_hdr[4]
+                              | ((uint32_t)ext_hdr[5] << 8)
+                              | ((uint32_t)ext_hdr[6] << 16)
+                              | ((uint32_t)ext_hdr[7] << 24);
+                if (plen > 0 && plen < (1u << 20)) {
+                    unsigned char* ext_buf = (unsigned char*)malloc(plen);
+                    if (ext_buf != NULL) {
+                        if (gzread(f, ext_buf, plen) == (int)plen) {
+                            rsp.loadState(ext_buf, plen);
+                        }
+                        free(ext_buf);
+                    }
+                }
+            }
+        }
+
+        gzclose(f);
+        SDL_UnlockMutex(savestates_lock);
+    }
 
     // Parse savestate
     dev->rdram.regs[0][RDRAM_CONFIG_REG]       = GETDATA(curr, uint32_t);
@@ -905,6 +998,24 @@ static int savestates_load_m64p(struct device* dev, char *filepath)
             dev->sp.first_run = GETDATA(curr, uint32_t);
             dev->sp.rsp_wait = GETDATA(curr, uint32_t);
         }
+
+        if (version >= 0x00020100)
+        {
+            /* AI controller hidden state — overrides the default fixup
+             * applied earlier (line ~514) which is only correct for older
+             * savestates that don't carry these fields. */
+            dev->ai.fifo[0].address = GETDATA(curr, uint32_t);
+            dev->ai.fifo[1].address = GETDATA(curr, uint32_t);
+            dev->ai.samples_format_changed = GETDATA(curr, uint32_t);
+        }
+
+        if (version >= 0x00020200)
+        {
+            /* cp0.last_addr — see save side comment. We read it here so that
+             * the post-load reset block below knows to keep this value
+             * instead of clobbering it with the current PC. */
+            *r4300_cp0_last_addr(&dev->r4300.cp0) = GETDATA(curr, uint32_t);
+        }
     }
     else
     {
@@ -978,10 +1089,17 @@ static int savestates_load_m64p(struct device* dev, char *filepath)
 
     dev->r4300.cp0.interrupt_unsafe_state = 0;
 
-    *r4300_cp0_last_addr(&dev->r4300.cp0) = *r4300_pc(&dev->r4300);
+    /* For savestates older than 2.2, last_addr wasn't saved — fall back to
+     * the historical "best effort" of resetting it to current PC. Newer
+     * savestates already restored the correct value above. */
+    if (version < 0x00020200) {
+        *r4300_cp0_last_addr(&dev->r4300.cp0) = *r4300_pc(&dev->r4300);
+    }
 
-    free(savestateData);
-    main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State loaded from: %s", namefrompath(filepath));
+    if (owns_savestate_data)
+        free(savestateData);
+    if (!buffer_mode)
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State loaded from: %s", namefrompath(filepath));
     return 1;
 }
 
@@ -1487,7 +1605,7 @@ int savestates_load(void)
 
         switch (type)
         {
-            case savestates_type_m64p: ret = savestates_load_m64p(dev, filepath); break;
+            case savestates_type_m64p: ret = savestates_load_m64p(dev, filepath, NULL, 0); break;
             case savestates_type_pj64_zip: ret = savestates_load_pj64_zip(dev, filepath); break;
             case savestates_type_pj64_unc: ret = savestates_load_pj64_unc(dev, filepath); break;
             default: ret = 0; break;
@@ -1543,12 +1661,21 @@ static void savestates_save_m64p_work(struct work_struct *work)
     StateChanged(M64CORE_STATE_SAVECOMPLETE, 1);
 }
 
-static int savestates_save_m64p(const struct device* dev, char *filepath)
+/* When out_save is NULL: builds the save state and queues an async file write
+ *   to filepath (existing behaviour).
+ * When out_save is non-NULL: builds the save state into a savestate_work struct
+ *   and returns it via *out_save (filepath ignored). Caller owns *out_save and
+ *   must free save->data and save itself when done. Used by Frame Zero rollback. */
+static int savestates_save_m64p(const struct device* dev, char *filepath, struct savestate_work **out_save)
 {
     unsigned char outbuf[4];
     int i;
 
-    char queue[1024];
+    /* Frame Zero: zero-init so trailing bytes after the FFFFFFFF terminator
+     * don't carry uninitialised stack memory into the snapshot. The load path
+     * stops at the terminator regardless, but byte-level snapshot equality is
+     * required for rollback determinism. */
+    char queue[1024] = {0};
 
     struct savestate_work *save;
     char *curr;
@@ -1563,15 +1690,22 @@ static int savestates_save_m64p(const struct device* dev, char *filepath)
         return 0;
     }
 
-    save->filepath = strdup(filepath);
+    save->filepath = (out_save == NULL) ? strdup(filepath) : NULL;
 
-    if(autoinc_save_slot)
+    if (out_save == NULL && autoinc_save_slot)
         savestates_inc_slot();
 
     save_eventqueue_infos(&dev->r4300.cp0, queue);
 
+    /* Frame Zero: reserve trailing room for the RSP plugin state extension
+     * (magic + length header + payload) when the loaded RSP plugin supports
+     * it. The HLE plugin's hle_t persistent fields total ~9 KB; pad to 16 KB
+     * to leave headroom for future plugin variants. */
+    unsigned int rsp_state_size = (rsp.getStateSize != NULL) ? rsp.getStateSize() : 0;
+    unsigned int rsp_section_size = (rsp_state_size > 0) ? (rsp_state_size + 8) : 0;
+
     // Allocate memory for the save state data
-    save->size = 16788288 + sizeof(queue) + 4 + 4096;
+    save->size = 16788288 + sizeof(queue) + 4 + 4096 + rsp_section_size + 4096;
     save->data = curr = malloc(save->size);
     if (save->data == NULL)
     {
@@ -1946,6 +2080,84 @@ static int savestates_save_m64p(const struct device* dev, char *filepath)
     PUTDATA(curr, uint32_t, dev->sp.first_run);
     PUTDATA(curr, uint32_t, dev->sp.rsp_wait);
 
+    /* AI controller hidden state (since 2.1, Frame Zero determinism fix).
+     * fifo[].address tracks the DRAM source of each in-flight DMA — without
+     * saving it, the load path falls back to AI_DRAM_ADDR_REG, which is the
+     * address of the most recent write, not the address each fifo entry was
+     * captured with. samples_format_changed forces a plugin re-init on the
+     * next DMA when set; without saving it, every restore forces re-init,
+     * which is wrong if the original capture had it cleared. */
+    PUTDATA(curr, uint32_t, dev->ai.fifo[0].address);
+    PUTDATA(curr, uint32_t, dev->ai.fifo[1].address);
+    PUTDATA(curr, uint32_t, dev->ai.samples_format_changed);
+
+    /* cp0.last_addr (since 2.2, Frame Zero CP0 cycle accounting fix).
+     * Used by cp0_update_count to compute (PC - last_addr) * count_per_op.
+     * Load path was forcing last_addr = current PC, which caused a permanent
+     * CP0_COUNT offset across save/restore cycles, drifting all downstream
+     * interrupt timing and N64 OS thread scheduling. */
+    PUTDATA(curr, uint32_t, *r4300_cp0_last_addr((struct cp0*)&dev->r4300.cp0));
+
+    /* Frame Zero: pad to the end of the data_0001_0200 region (4096 bytes
+     * starting after using_tlb_data) before writing the RSP1 trailer. The
+     * load path always reads 4096 bytes for data_0001_0200 and then looks
+     * for the RSP1 magic at savestate offset 44 + 16788244 + 1024 + 4 +
+     * 4096 = 16793412. Without this pad, save lands `curr` only ~1175
+     * bytes into data_0001_0200 and writes RSP1 there — load can't find
+     * the magic at 16793412 (it sees the middle of the RSP payload), so
+     * rsp.loadState is silently skipped and the HLE plugin's persistent
+     * audio state is never restored. That breaks rollback determinism:
+     * leg 2's audio mixer state carries over from leg 1's advance instead
+     * of restarting from the captured state. */
+    {
+        size_t data_0001_0200_offset = 44u + 16788244u + sizeof(queue)
+                                     + sizeof(uint32_t) /* using_tlb */
+                                     + 4096u;
+        char* rsp1_target = (char*)save->data + data_0001_0200_offset;
+        if (curr < rsp1_target) {
+            /* save->data was memset(0) earlier; the gap remains zero. */
+            curr = rsp1_target;
+        }
+    }
+
+    /* Frame Zero: append RSP plugin state. Format is
+     *   magic[4]  = "RSP1"
+     *   len[4]    = uint32 little-endian payload length
+     *   payload[] = plugin-defined state bytes
+     * Loaders that don't recognise the magic skip the trailing bytes,
+     * so this is forward-compatible with savestates produced by older
+     * cores. The HLE plugin defines ~9 KB of audio mixer state. */
+    if (rsp.getStateSize && rsp.saveState && rsp_state_size > 0) {
+        unsigned int written = 0;
+        memcpy(curr, "RSP1", 4);
+        curr += 4;
+        char* len_pos = curr;
+        PUTDATA(curr, uint32_t, rsp_state_size);
+        if (rsp.saveState((unsigned char*)curr, rsp_state_size, &written) && written > 0) {
+            /* If the plugin reported a different length, fix the header. */
+            if (written != rsp_state_size) {
+                char* save_curr = curr;
+                curr = len_pos;
+                PUTDATA(curr, uint32_t, written);
+                curr = save_curr;
+            }
+            curr += written;
+        } else {
+            /* Plugin failed — back the magic+len out so the load side
+             * doesn't see a half-written extension. */
+            curr = len_pos - 4;
+        }
+    }
+
+    if (out_save != NULL) {
+        /* Buffer mode (Frame Zero): hand the work struct to caller.
+         * Trim save->size to what we actually wrote so the buffer the
+         * caller receives is the exact length. */
+        save->size = (size_t)(curr - save->data);
+        *out_save = save;
+        return 1;
+    }
+
     init_work(&save->work, savestates_save_m64p_work);
     queue_work(&save->work);
 
@@ -2191,6 +2403,50 @@ static int savestates_save_pj64_unc(const struct device* dev, char *filepath)
     return 1;
 }
 
+/* Frame Zero — buffer-based savestate API.
+ * Synchronous; no compression, no file I/O. */
+
+EXPORT size_t CALL savestates_get_state_size(void)
+{
+    /* Standard layout: 16,788,288 + queue (1024) + 4 + 4096 = 16,793,412.
+     * v2.1 fields (ai.fifo addresses + samples_format_changed) and v2.2
+     * field (cp0.last_addr) live INSIDE the 4096-byte data_0001_0200
+     * region, so they're already counted — do NOT add them again.
+     * Plus optional Frame Zero RSP plugin extension (magic+len+payload). */
+    size_t base = 16788288 + 1024 + 4 + 4096;
+    if (rsp.getStateSize != NULL) {
+        unsigned int psize = rsp.getStateSize();
+        if (psize > 0)
+            base += 8 + psize;
+    }
+    return base;
+}
+
+EXPORT int CALL savestates_save_to_buffer(uint8_t** out_buf, size_t* out_len)
+{
+    struct savestate_work* save = NULL;
+
+    if (out_buf == NULL || out_len == NULL)
+        return 0;
+
+    if (!savestates_save_m64p(&g_dev, NULL, &save) || save == NULL)
+        return 0;
+
+    *out_buf = (uint8_t*)save->data;
+    *out_len = save->size;
+    /* save->data ownership transferred to caller. */
+    free(save->filepath); /* should be NULL in buffer mode but be defensive */
+    free(save);
+    return 1;
+}
+
+EXPORT int CALL savestates_load_from_buffer(const uint8_t* buf, size_t len)
+{
+    if (buf == NULL || len == 0)
+        return 0;
+    return savestates_load_m64p(&g_dev, NULL, buf, len);
+}
+
 int savestates_save(void)
 {
     char *filepath;
@@ -2214,7 +2470,7 @@ int savestates_save(void)
     {
         switch (type)
         {
-            case savestates_type_m64p: ret = savestates_save_m64p(dev, filepath); break;
+            case savestates_type_m64p: ret = savestates_save_m64p(dev, filepath, NULL); break;
             case savestates_type_pj64_zip: ret = savestates_save_pj64_zip(dev, filepath); break;
             case savestates_type_pj64_unc: ret = savestates_save_pj64_unc(dev, filepath); break;
             default: ret = 0; StateChanged(M64CORE_STATE_SAVECOMPLETE, ret); break;

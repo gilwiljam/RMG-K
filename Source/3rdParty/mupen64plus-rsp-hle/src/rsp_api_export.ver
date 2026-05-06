@@ -5,4 +5,7 @@ PluginGetVersion;
 DoRspCycles;
 InitiateRSP;
 RomClosed;
+RspGetStateSize;
+RspSaveState;
+RspLoadState;
 local: *; };

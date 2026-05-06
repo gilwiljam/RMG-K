@@ -39,6 +39,7 @@ set(RMG_CORE_SOURCES
     Library.cpp
     Netplay.cpp
     Kaillera.cpp
+    FrameZeroState.cpp
     Plugins.cpp
     Version.cpp
     Cheats.cpp

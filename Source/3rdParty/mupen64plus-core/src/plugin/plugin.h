@@ -117,6 +117,15 @@ typedef struct _rsp_plugin_functions
 	ptr_DoRspCycles         doRspCycles;
 	ptr_InitiateRSP         initiateRSP;
 	ptr_RomClosed           romClosed;
+
+	/* Frame Zero rollback state extension (optional). NULL if the
+	 * loaded RSP plugin doesn't export these symbols (e.g. third-party
+	 * plugins). When present, the savestate code calls them to capture
+	 * plugin-internal audio mixer state that mupen64plus-core's
+	 * own savestate format does not cover. */
+	unsigned int (*getStateSize)(void);
+	int          (*saveState)(unsigned char* buf, unsigned int max_len, unsigned int* out_len);
+	int          (*loadState)(const unsigned char* buf, unsigned int len);
 } rsp_plugin_functions;
 
 extern rsp_plugin_functions rsp;

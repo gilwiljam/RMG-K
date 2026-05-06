@@ -26,6 +26,7 @@
 #include "device/rcp/ri/ri_controller.h"
 #include "device/rcp/vi/vi_controller.h"
 #include "device/rdram/rdram.h"
+#include "main/main.h"
 #include "main/rom.h"
 #include "plugin/plugin.h"
 
@@ -43,6 +44,13 @@ static void audio_plugin_set_frequency(void* aout, unsigned int frequency)
 
 static void audio_plugin_push_samples(void* aout, const void* buffer, size_t size)
 {
+    /* Frame Zero: skip pushing samples to the audio backend during silent
+     * rollback re-simulation. Samples are still computed by the HLE plugin
+     * and written to N64 RDRAM (which is part of the simulation state) —
+     * we just don't queue them to SDL for playback. */
+    if (g_RollbackMode)
+        return;
+
     /* abuse core & audio plugin implementation to approximate desired effect */
     struct ai_controller* ai = (struct ai_controller*)aout;
     uint32_t saved_ai_length = ai->regs[AI_LEN_REG];

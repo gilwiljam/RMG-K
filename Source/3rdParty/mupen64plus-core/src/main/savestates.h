@@ -25,6 +25,11 @@
 #ifndef __SAVESTAVES_H__
 #define __SAVESTAVES_H__
 
+#include <stddef.h>
+#include <stdint.h>
+
+#include "api/m64p_types.h"
+
 typedef enum _savestates_job
 {
     savestates_job_nothing,
@@ -47,6 +52,23 @@ void savestates_deinit(void);
 
 int savestates_load(void);
 int savestates_save(void);
+
+/* Frame Zero buffer-based savestate API.
+ * Synchronous, no compression, no file I/O. Used for rollback snapshots.
+ * Buffer layout matches what savestates_save_m64p() builds in memory. */
+
+/* Returns the size in bytes that savestates_save_to_buffer will produce. */
+EXPORT size_t CALL savestates_get_state_size(void);
+
+/* Captures full m64p savestate to a freshly malloc'd buffer.
+ * Caller takes ownership of *out_buf and must free() it.
+ * Returns 1 on success, 0 on failure. */
+EXPORT int CALL savestates_save_to_buffer(uint8_t** out_buf, size_t* out_len);
+
+/* Applies a savestate previously produced by savestates_save_to_buffer.
+ * Skips MD5 check (caller is responsible for ensuring same ROM).
+ * Returns 1 on success, 0 on failure. */
+EXPORT int CALL savestates_load_from_buffer(const uint8_t* buf, size_t len);
 
 void savestates_select_slot(unsigned int s);
 unsigned int savestates_get_slot(void);

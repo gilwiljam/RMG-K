@@ -43,6 +43,9 @@ extern int g_RomWordsLittleEndian;
 extern int g_EmulatorRunning;
 extern int g_rom_pause;
 
+/* Frame Zero rollback mode flag — see main.c. */
+extern int g_RollbackMode;
+
 extern struct cheat_ctx g_cheat_ctx;
 
 extern void* g_mem_base;
@@ -73,6 +76,17 @@ m64p_error main_run(void);
 void main_stop(void);
 void main_toggle_pause(void);
 void main_advance_one(void);
+
+/* Frame Zero: silent step + rollback flag accessors.
+ * Exported so RMG-Core can dlsym them. */
+EXPORT void CALL advance_one_frame_silent(void);
+EXPORT void CALL core_set_rollback_mode(int mode);
+EXPORT int  CALL core_get_rollback_mode(void);
+EXPORT void CALL core_set_input_neutralize(int v);
+EXPORT int  CALL core_get_input_neutralize(void);
+
+/* Read by input_plugin_compat.c. */
+extern int g_FrameZero_NeutralizeInput;
 
 void main_speedup(int percent);
 void main_speeddown(int percent);

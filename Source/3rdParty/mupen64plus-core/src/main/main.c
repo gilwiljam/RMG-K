@@ -105,6 +105,23 @@ int         g_EmulatorRunning = 0;      // need separate boolean to tell if emul
 
 int g_rom_pause;
 
+/* Frame Zero rollback mode flag.
+ * When non-zero, per-frame side effects that don't affect simulation state
+ * are suppressed: GFX updateScreen (vi_controller.c, rdp_core.c) and audio
+ * sample push to the audio plugin (audio_plugin_compat.c). Audio samples
+ * are still computed by the HLE plugin and written to N64 RDRAM (which IS
+ * simulation state); only the push to the host audio backend is skipped.
+ * Set/cleared by core_set_rollback_mode(). */
+int g_RollbackMode = 0;
+
+/* Frame Zero input-neutralize flag.
+ * When non-zero, controller polls in input_plugin_compat.c return all-zero
+ * BUTTONS values so the user pressing buttons during a determinism test
+ * does not affect game state across the two test legs.
+ * Independent of g_RollbackMode because the determinism test still wants
+ * video and audio output visible during its advance phases. */
+int g_FrameZero_NeutralizeInput = 0;
+
 struct cheat_ctx g_cheat_ctx;
 
 /* g_mem_base is global to allow plugins early access (before device is initialized).
@@ -616,6 +633,36 @@ void main_advance_one(void)
     StateChanged(M64CORE_EMU_STATE, M64EMU_RUNNING);
 }
 
+/* Frame Zero: step one frame with rendering and audio output suppressed.
+ * Used by rollback re-simulation. Caller must already be paused. */
+EXPORT void CALL advance_one_frame_silent(void)
+{
+    g_RollbackMode = 1;
+    l_FrameAdvance = 1;
+    g_rom_pause = 0;
+    StateChanged(M64CORE_EMU_STATE, M64EMU_RUNNING);
+}
+
+EXPORT void CALL core_set_rollback_mode(int mode)
+{
+    g_RollbackMode = mode ? 1 : 0;
+}
+
+EXPORT int CALL core_get_rollback_mode(void)
+{
+    return g_RollbackMode;
+}
+
+EXPORT void CALL core_set_input_neutralize(int v)
+{
+    g_FrameZero_NeutralizeInput = v ? 1 : 0;
+}
+
+EXPORT int CALL core_get_input_neutralize(void)
+{
+    return g_FrameZero_NeutralizeInput;
+}
+
 static void main_draw_volume_osd(void)
 {
     char msgString[64];
@@ -964,6 +1011,7 @@ void new_frame(void)
     if (l_FrameAdvance) {
         g_rom_pause = 1;
         l_FrameAdvance = 0;
+        g_RollbackMode = 0; /* Frame Zero: clear rollback flag after silent advance */
         StateChanged(M64CORE_EMU_STATE, M64EMU_PAUSED);
     }
 }
@@ -1635,8 +1683,20 @@ m64p_error main_run(void)
     savestates_set_autoinc_slot(ConfigGetParamBool(g_CoreConfig, "AutoStateSlotIncrement"));
     savestates_select_slot(ConfigGetParamInt(g_CoreConfig, "CurrentStateSlot"));
     no_compiled_jump = ConfigGetParamBool(g_CoreConfig, "NoCompiledJump");
-    //We disable any randomness for netplay
-    randomize_interrupt = !netplay_is_init() ? ConfigGetParamBool(g_CoreConfig, "RandomizeInterrupt") : 0;
+    //We disable any randomness for netplay AND for Frame Zero rollback determinism.
+    //rand() is host-process state and is NOT captured in savestates, so any random
+    //interrupt jitter would diverge across save/restore cycles — fatal for rollback.
+    {
+        const char* fz_roundtrip = getenv("FRAME_ZERO_ROUNDTRIP");
+        int fz_active = (fz_roundtrip != NULL && fz_roundtrip[0] != '\0' && fz_roundtrip[0] != '0');
+        randomize_interrupt = (!netplay_is_init() && !fz_active)
+            ? ConfigGetParamBool(g_CoreConfig, "RandomizeInterrupt")
+            : 0;
+        DebugMessage(M64MSG_INFO,
+            "[FrameZero] randomize_interrupt=%d (netplay=%d fz_active=%d FRAME_ZERO_ROUNDTRIP=%s)",
+            randomize_interrupt, netplay_is_init() ? 1 : 0, fz_active,
+            fz_roundtrip ? fz_roundtrip : "(unset)");
+    }
     count_per_op = ConfigGetParamInt(g_CoreConfig, "CountPerOp");
     count_per_op_denom_pot = ConfigGetParamInt(g_CoreConfig, "CountPerOpDenomPot");
 

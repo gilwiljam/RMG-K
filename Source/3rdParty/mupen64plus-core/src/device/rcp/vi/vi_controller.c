@@ -165,7 +165,7 @@ void vi_vertical_interrupt_event(void* opaque)
     struct vi_controller* vi = (struct vi_controller*)opaque;
     if (vi->dp->do_on_unfreeze & DELAY_DP_INT)
         vi->dp->do_on_unfreeze |= DELAY_UPDATESCREEN;
-    else
+    else if (!g_RollbackMode)
         gfx.updateScreen();
 
     /* allow main module to do things on VI event */

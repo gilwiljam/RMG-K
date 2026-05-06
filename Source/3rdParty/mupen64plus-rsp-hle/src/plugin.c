@@ -78,6 +78,7 @@ static ptr_DoRspCycles l_DoRspCycles = NULL;
 static ptr_RomClosed l_RomClosed = NULL;
 static ptr_PluginShutdown l_PluginShutdown = NULL;
 
+
 /* definitions of pointers to Core functions */
 static ptr_ConfigOpenSection      ConfigOpenSection = NULL;
 static ptr_ConfigDeleteSection    ConfigDeleteSection = NULL;
@@ -339,6 +340,7 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle CoreLibHandle, void *Con
         return M64ERR_INCOMPATIBLE;
     }
 
+
     /* get a configuration section handle */
     if (ConfigOpenSection(RSP_HLE_CONFIG_SECTION, &l_ConfigRspHle) != M64ERR_SUCCESS)
     {
@@ -478,4 +480,77 @@ EXPORT void CALL RomClosed(void)
     if (l_RomClosed) {
         l_RomClosed();
     }
+}
+
+/* Frame Zero rollback support — save/restore the persistent fields of
+ * struct hle_t (audio mixer envelopes, ADPCM tables, scratch buffers,
+ * filter state). These are NOT covered by mupen64plus-core's savestate
+ * format, which is a determinism gap for rollback netcode.
+ *
+ * The cached_ucodes table holds host function pointers that aren't
+ * portable across saves; we simply clear it on load and let it refill
+ * lazily as new ucodes are encountered.
+ *
+ * Format is host-endian raw struct/buffer dump. Cross-machine rollback
+ * (e.g. mixed-endian peers) would require explicit byte-swapping; that's
+ * not a concern for x86_64 ↔ x86_64 P2P.
+ */
+EXPORT unsigned int CALL RspGetStateSize(void)
+{
+    return (unsigned int)(
+          sizeof(g_hle.alist_buffer)
+        + sizeof(g_hle.alist_audio)
+        + sizeof(g_hle.alist_naudio)
+        + sizeof(g_hle.alist_nead)
+        + sizeof(g_hle.mp3_buffer)
+    );
+}
+
+EXPORT int CALL RspSaveState(unsigned char* buf, unsigned int max_len, unsigned int* out_len)
+{
+    unsigned char* p;
+    unsigned int needed;
+
+    if (buf == NULL)
+        return 0;
+
+    needed = RspGetStateSize();
+    if (max_len < needed)
+        return 0;
+
+    p = buf;
+    memcpy(p, g_hle.alist_buffer,  sizeof(g_hle.alist_buffer));  p += sizeof(g_hle.alist_buffer);
+    memcpy(p, &g_hle.alist_audio,  sizeof(g_hle.alist_audio));   p += sizeof(g_hle.alist_audio);
+    memcpy(p, &g_hle.alist_naudio, sizeof(g_hle.alist_naudio));  p += sizeof(g_hle.alist_naudio);
+    memcpy(p, &g_hle.alist_nead,   sizeof(g_hle.alist_nead));    p += sizeof(g_hle.alist_nead);
+    memcpy(p, g_hle.mp3_buffer,    sizeof(g_hle.mp3_buffer));    p += sizeof(g_hle.mp3_buffer);
+
+    if (out_len)
+        *out_len = needed;
+    return 1;
+}
+
+EXPORT int CALL RspLoadState(const unsigned char* buf, unsigned int len)
+{
+    const unsigned char* p;
+    unsigned int needed;
+
+    if (buf == NULL)
+        return 0;
+
+    needed = RspGetStateSize();
+    if (len < needed)
+        return 0;
+
+    p = buf;
+    memcpy(g_hle.alist_buffer,  p, sizeof(g_hle.alist_buffer));  p += sizeof(g_hle.alist_buffer);
+    memcpy(&g_hle.alist_audio,  p, sizeof(g_hle.alist_audio));   p += sizeof(g_hle.alist_audio);
+    memcpy(&g_hle.alist_naudio, p, sizeof(g_hle.alist_naudio));  p += sizeof(g_hle.alist_naudio);
+    memcpy(&g_hle.alist_nead,   p, sizeof(g_hle.alist_nead));    p += sizeof(g_hle.alist_nead);
+    memcpy(g_hle.mp3_buffer,    p, sizeof(g_hle.mp3_buffer));    p += sizeof(g_hle.mp3_buffer);
+
+    /* Clear the function-pointer cache; it'll lazily refill. */
+    g_hle.cached_ucodes.count = 0;
+
+    return 1;
 }

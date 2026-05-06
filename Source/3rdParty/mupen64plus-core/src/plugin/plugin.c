@@ -477,6 +477,14 @@ static m64p_error plugin_connect_rsp(m64p_dynlib_handle plugin_handle)
             return M64ERR_INPUT_INVALID;
         }
 
+        /* Frame Zero rollback extension — optional. NULL if absent. */
+        rsp.getStateSize = (unsigned int (*)(void))
+            osal_dynlib_getproc(plugin_handle, "RspGetStateSize");
+        rsp.saveState    = (int (*)(unsigned char*, unsigned int, unsigned int*))
+            osal_dynlib_getproc(plugin_handle, "RspSaveState");
+        rsp.loadState    = (int (*)(const unsigned char*, unsigned int))
+            osal_dynlib_getproc(plugin_handle, "RspLoadState");
+
         /* check the version info */
         (*rsp.getVersion)(&PluginType, &PluginVersion, &APIVersion, NULL, NULL);
         if (PluginType != M64PLUGIN_RSP || (APIVersion & 0xffff0000) != (RSP_API_VERSION & 0xffff0000))

@@ -18,11 +18,19 @@
 #include "Kaillera.hpp"
 #include "Plugins.hpp"
 #include "Cheats.hpp"
+#include "Callback.hpp"
+#include "FrameZeroState.hpp"
 #include "Error.hpp"
 #include "File.hpp"
 #include "Rom.hpp"
 
 #include "m64p/Api.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <vector>
 
 // Windows/POSIX dynamic loading
 #ifdef _WIN32
@@ -69,6 +77,751 @@ extern "C" {
 // Frame counter for Kaillera sync (updated via frame callback)
 static int s_CurrentFrame = 0;
 
+//
+// Frame Zero — Phase 0.5 silent-advance spike (THROWAWAY)
+//
+// Activate by setting environment variable FRAME_ZERO_SPIKE=1 before launch.
+// State machine driven from FrameCallback. Measures wall-clock-per-frame
+// across 300 normal frames + 300 silent frames, logs a one-shot summary,
+// then disarms itself.
+//
+// Speed limiter is toggled OFF for the measurement window so we see real
+// frame-advance time, not sleep.
+//
+
+namespace {
+
+enum class SpikePhase
+{
+    Disabled,      // env var not set; do nothing
+    Settle,        // wait N frames for the game to stabilise
+    MeasureNormal, // collect timings with g_RollbackMode=0
+    Switch,        // flip g_RollbackMode and zero out timing window
+    MeasureSilent, // collect timings with g_RollbackMode=1
+    Done           // report and disarm
+};
+
+constexpr int kSpikeSettleFrames = 600;
+constexpr int kSpikeMeasureFrames = 300;
+
+struct SpikeState
+{
+    SpikePhase phase = SpikePhase::Disabled;
+    int frameInPhase = 0;
+    int prevSpeedLimiter = 1;
+    using TimePoint = std::chrono::steady_clock::time_point;
+    TimePoint lastFrameTime;
+    std::vector<double> normalSamplesUs;
+    std::vector<double> silentSamplesUs;
+    void (*setRollbackMode)(int) = nullptr;
+};
+
+static SpikeState s_Spike;
+
+static void SpikeReportSamples(const char* label, const std::vector<double>& samples)
+{
+    if (samples.empty())
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Info,
+            std::string("[FrameZero spike] ") + label + ": no samples");
+        return;
+    }
+
+    std::vector<double> sorted = samples;
+    std::sort(sorted.begin(), sorted.end());
+
+    double sum = 0.0;
+    for (double v : sorted) sum += v;
+    const double mean = sum / static_cast<double>(sorted.size());
+    const double minV = sorted.front();
+    const double maxV = sorted.back();
+    const double p50  = sorted[sorted.size() / 2];
+    const double p99  = sorted[(sorted.size() * 99) / 100];
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "[FrameZero spike] %s: n=%zu  min=%.2fms  p50=%.2fms  mean=%.2fms  p99=%.2fms  max=%.2fms",
+        label, sorted.size(),
+        minV / 1000.0, p50 / 1000.0, mean / 1000.0, p99 / 1000.0, maxV / 1000.0);
+
+    CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
+}
+
+static void SpikeArm()
+{
+    const char* env = std::getenv("FRAME_ZERO_SPIKE");
+    if (env == nullptr || env[0] == '\0' || env[0] == '0')
+    {
+        s_Spike.phase = SpikePhase::Disabled;
+        return;
+    }
+
+    // Resolve core_set_rollback_mode dynamically.
+    void* coreHandle = m64p::Core.GetHandle();
+    s_Spike.setRollbackMode = nullptr;
+    if (coreHandle)
+    {
+#ifdef _WIN32
+        s_Spike.setRollbackMode =
+            (void(*)(int))GetProcAddress((HMODULE)coreHandle, "core_set_rollback_mode");
+#else
+        s_Spike.setRollbackMode =
+            (void(*)(int))dlsym(coreHandle, "core_set_rollback_mode");
+#endif
+    }
+
+    if (s_Spike.setRollbackMode == nullptr)
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+            "[FrameZero spike] core_set_rollback_mode not exported — rebuild mupen64plus-core. Spike disabled.");
+        s_Spike.phase = SpikePhase::Disabled;
+        return;
+    }
+
+    s_Spike.phase = SpikePhase::Settle;
+    s_Spike.frameInPhase = 0;
+    s_Spike.normalSamplesUs.clear();
+    s_Spike.silentSamplesUs.clear();
+    s_Spike.normalSamplesUs.reserve(kSpikeMeasureFrames);
+    s_Spike.silentSamplesUs.reserve(kSpikeMeasureFrames);
+
+    CoreAddCallbackMessage(CoreDebugMessageType::Info,
+        "[FrameZero spike] Armed. Will settle for "
+        + std::to_string(kSpikeSettleFrames) + " frames, then measure "
+        + std::to_string(kSpikeMeasureFrames) + " normal + "
+        + std::to_string(kSpikeMeasureFrames) + " silent frames.");
+}
+
+static void SpikeTick()
+{
+    using clock = std::chrono::steady_clock;
+
+    if (s_Spike.phase == SpikePhase::Disabled || s_Spike.phase == SpikePhase::Done)
+        return;
+
+    const auto now = clock::now();
+
+    switch (s_Spike.phase)
+    {
+        case SpikePhase::Settle:
+        {
+            ++s_Spike.frameInPhase;
+            if (s_Spike.frameInPhase >= kSpikeSettleFrames)
+            {
+                // Disable speed limiter so we measure true frame-advance time.
+                int currentLimiter = 1;
+                m64p::Core.DoCommand(M64CMD_CORE_STATE_QUERY,
+                    M64CORE_SPEED_LIMITER, &currentLimiter);
+                s_Spike.prevSpeedLimiter = currentLimiter;
+                int off = 0;
+                m64p::Core.DoCommand(M64CMD_CORE_STATE_SET,
+                    M64CORE_SPEED_LIMITER, &off);
+
+                s_Spike.phase = SpikePhase::MeasureNormal;
+                s_Spike.frameInPhase = 0;
+                s_Spike.lastFrameTime = now;
+                CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                    "[FrameZero spike] Settled. Measuring normal frames…");
+            }
+            break;
+        }
+        case SpikePhase::MeasureNormal:
+        {
+            const double dtUs =
+                std::chrono::duration<double, std::micro>(now - s_Spike.lastFrameTime).count();
+            s_Spike.lastFrameTime = now;
+            s_Spike.normalSamplesUs.push_back(dtUs);
+            ++s_Spike.frameInPhase;
+            if (s_Spike.frameInPhase >= kSpikeMeasureFrames)
+            {
+                s_Spike.phase = SpikePhase::Switch;
+                s_Spike.frameInPhase = 0;
+            }
+            break;
+        }
+        case SpikePhase::Switch:
+        {
+            // Enter rollback mode for the silent measurement window.
+            // We hold the flag for the entire window rather than calling
+            // advance_one_frame_silent() per frame, because the latter requires
+            // the emulator to be paused — here we want continuous running.
+            if (s_Spike.setRollbackMode)
+                s_Spike.setRollbackMode(1);
+            s_Spike.phase = SpikePhase::MeasureSilent;
+            s_Spike.frameInPhase = 0;
+            s_Spike.lastFrameTime = now;
+            CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                "[FrameZero spike] Rollback mode ON. Measuring silent frames…");
+            break;
+        }
+        case SpikePhase::MeasureSilent:
+        {
+            const double dtUs =
+                std::chrono::duration<double, std::micro>(now - s_Spike.lastFrameTime).count();
+            s_Spike.lastFrameTime = now;
+            s_Spike.silentSamplesUs.push_back(dtUs);
+            ++s_Spike.frameInPhase;
+            if (s_Spike.frameInPhase >= kSpikeMeasureFrames)
+            {
+                if (s_Spike.setRollbackMode)
+                    s_Spike.setRollbackMode(0);
+
+                int prev = s_Spike.prevSpeedLimiter;
+                m64p::Core.DoCommand(M64CMD_CORE_STATE_SET,
+                    M64CORE_SPEED_LIMITER, &prev);
+
+                SpikeReportSamples("normal", s_Spike.normalSamplesUs);
+                SpikeReportSamples("silent", s_Spike.silentSamplesUs);
+
+                // Compute and report the all-important ratio.
+                if (!s_Spike.normalSamplesUs.empty() && !s_Spike.silentSamplesUs.empty())
+                {
+                    auto mean = [](const std::vector<double>& v) {
+                        double sum = 0.0;
+                        for (double x : v) sum += x;
+                        return sum / static_cast<double>(v.size());
+                    };
+                    const double meanNormal = mean(s_Spike.normalSamplesUs);
+                    const double meanSilent = mean(s_Spike.silentSamplesUs);
+                    char buf[256];
+                    snprintf(buf, sizeof(buf),
+                        "[FrameZero spike] Silent vs normal: %.2fms vs %.2fms (silent is %.0f%% of normal)",
+                        meanSilent / 1000.0, meanNormal / 1000.0,
+                        meanNormal > 0.0 ? (100.0 * meanSilent / meanNormal) : 0.0);
+                    CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
+                }
+
+                CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                    "[FrameZero spike] Done. Speed limiter restored. Spike disarmed.");
+                s_Spike.phase = SpikePhase::Done;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+//
+// Frame Zero — Phase 1 savestate roundtrip correctness test (THROWAWAY)
+//
+// Activate by setting FRAME_ZERO_ROUNDTRIP=1 before launch.
+//
+// Two modes (FRAME_ZERO_ROUNDTRIP_MODE):
+//   0 (default) — full advance test:
+//       capture(slot0) → advance N → capture(slot1) → restore(slot0)
+//       → advance N → capture(slot2). slot1 and slot2 must be byte-identical.
+//       Failure means EITHER the snapshot is missing state OR the emulator
+//       advances non-deterministically given identical input state.
+//   1 — reversibility test:
+//       capture(slot0) → restore(slot0) → capture(slot3). slot0 and slot3
+//       must be byte-identical. This isolates "is the snapshot complete"
+//       from advance non-determinism. If reversibility passes but the
+//       full test fails, the gap is in execution determinism, not state.
+//
+// IMPORTANT: do not press any buttons during the test, or the second pass
+// will see different inputs and the test will report a false desync.
+//
+
+enum class RoundtripPhase
+{
+    Disabled,
+    Settle,             // wait for game to stabilise
+    Capture0,           // capture slot 0
+    /* Reversibility mode (FRAME_ZERO_ROUNDTRIP_MODE=1): in a single tick,
+     * captures slot 0, then immediately restores slot 0, then captures
+     * slot 3 with NO emulation between. Tests whether save+restore is
+     * byte-perfect — any byte that differs between slot 0 and slot 3 is
+     * a field the snapshot reads but doesn't restore (or a field that
+     * the load path mutates as a side-effect). */
+    AdvanceFirst,       // advance N frames
+    Capture1,           // capture slot 1 (post-advance state)
+    Restore0,           // restore slot 0
+    PostRestoreHold,    // hold rewound state on screen so user can see it
+    AdvanceSecond,      // advance N frames again
+    Capture2,           // capture slot 2 (post-redo state)
+    Compare,            // diff slot 1 vs slot 2
+    Done
+};
+
+/* Defaults overridable via env vars (read at arm time):
+ *   FRAME_ZERO_ROUNDTRIP_SETTLE   = settle frames before test fires (min 60)
+ *   FRAME_ZERO_ROUNDTRIP_ADVANCE  = advance frames per leg (min 1)
+ *
+ * For diagnosis: shrinking advance to e.g. 1 isolates whether divergence is
+ * per-frame or only accumulates over many frames. */
+constexpr int kRoundtripSettleFramesDefault = 300;
+constexpr int kRoundtripAdvanceFramesDefault = 300;
+constexpr int kRoundtripHoldFrames = 60;        // 1 sec hold on rewound state
+
+struct RoundtripState
+{
+    RoundtripPhase phase = RoundtripPhase::Disabled;
+    int frameInPhase = 0;
+    int settleFrames = kRoundtripSettleFramesDefault;
+    int advanceFrames = kRoundtripAdvanceFramesDefault;
+    int holdFrames = kRoundtripHoldFrames;  // computed at arm time
+    int mode = 0;  // 0 = full advance test, 1 = reversibility only
+    unsigned int frameAtCapture0 = 0;
+    unsigned int frameAtCapture1 = 0;
+    unsigned int frameAtRestore = 0;
+    int prevSpeedLimiter = 1;
+    bool savedSpeedLimiter = false;
+    int rollbackEnable = 0;  // 1 = engage g_RollbackMode during advance phases
+    void (*setInputNeutralize)(int) = nullptr;
+    void (*setRollbackMode)(int) = nullptr;
+};
+
+static RoundtripState s_Roundtrip;
+
+static void RoundtripForceLimiterOn()
+{
+    int curr = 1;
+    if (m64p::Core.DoCommand(M64CMD_CORE_STATE_QUERY, M64CORE_SPEED_LIMITER, &curr) == M64ERR_SUCCESS)
+    {
+        s_Roundtrip.prevSpeedLimiter = curr;
+        s_Roundtrip.savedSpeedLimiter = true;
+    }
+    int on = 1;
+    m64p::Core.DoCommand(M64CMD_CORE_STATE_SET, M64CORE_SPEED_LIMITER, &on);
+}
+
+static void RoundtripRestoreLimiter()
+{
+    if (!s_Roundtrip.savedSpeedLimiter)
+        return;
+    int prev = s_Roundtrip.prevSpeedLimiter;
+    m64p::Core.DoCommand(M64CMD_CORE_STATE_SET, M64CORE_SPEED_LIMITER, &prev);
+    s_Roundtrip.savedSpeedLimiter = false;
+}
+
+static void RoundtripArm()
+{
+    const char* env = std::getenv("FRAME_ZERO_ROUNDTRIP");
+    if (env == nullptr || env[0] == '\0' || env[0] == '0')
+    {
+        s_Roundtrip.phase = RoundtripPhase::Disabled;
+        return;
+    }
+
+    if (!FrameZero::stateInit())
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+            "[FrameZero roundtrip] FrameZero::stateInit() failed — savestate API not exported. Test disabled.");
+        s_Roundtrip.phase = RoundtripPhase::Disabled;
+        return;
+    }
+
+    /* Settle override: longer settle lets the user navigate menus and start
+     * a match before the test fires. Floors at 60 (1 second) so we always
+     * have at least one VI tick to stabilise. */
+    s_Roundtrip.settleFrames = kRoundtripSettleFramesDefault;
+    if (const char* settle_env = std::getenv("FRAME_ZERO_ROUNDTRIP_SETTLE"))
+    {
+        int v = std::atoi(settle_env);
+        if (v >= 60)
+            s_Roundtrip.settleFrames = v;
+    }
+
+    /* Advance override: lets us shrink the leg to isolate per-frame vs
+     * accumulated divergence. Min 1; if smaller than kRoundtripHoldFrames
+     * we suppress the hold so the second leg's frame count still matches. */
+    s_Roundtrip.advanceFrames = kRoundtripAdvanceFramesDefault;
+    if (const char* adv_env = std::getenv("FRAME_ZERO_ROUNDTRIP_ADVANCE"))
+    {
+        int v = std::atoi(adv_env);
+        if (v >= 1)
+            s_Roundtrip.advanceFrames = v;
+    }
+
+    /* Mode select:
+     *   0 (default) = full advance test (capture0→advance→capture1→restore0→advance→capture2→compare1vs2)
+     *   1           = reversibility only (capture0→restore0→capture3→compare0vs3)
+     * Mode 1 isolates "is the savestate complete" from "does the emulator
+     * advance deterministically given identical state". */
+    s_Roundtrip.mode = 0;
+    if (const char* mode_env = std::getenv("FRAME_ZERO_ROUNDTRIP_MODE"))
+    {
+        int v = std::atoi(mode_env);
+        if (v == 1)
+            s_Roundtrip.mode = 1;
+    }
+
+    /* Rollback-mode opt-in: engages g_RollbackMode during advance phases so
+     * the GFX updateScreen and audio push_samples side effects are suppressed
+     * during the silent re-simulation legs. Doesn't change comparison input
+     * (samples are still computed by HLE and written to N64 RDRAM), but it
+     * exercises the production rollback wiring end-to-end and makes the
+     * advance phases run at full headless speed. */
+    s_Roundtrip.rollbackEnable = 0;
+    if (const char* rb_env = std::getenv("FRAME_ZERO_ROUNDTRIP_ROLLBACK"))
+    {
+        if (rb_env[0] != '\0' && rb_env[0] != '0')
+            s_Roundtrip.rollbackEnable = 1;
+    }
+
+    /* Resolve the input-neutralize hook. Optional — if mupen64plus-core is
+     * older and doesn't export it, the test still runs but the user must
+     * not press buttons during the advance phases. */
+    s_Roundtrip.setInputNeutralize = nullptr;
+    s_Roundtrip.setRollbackMode = nullptr;
+    if (void* coreHandle = m64p::Core.GetHandle())
+    {
+#ifdef _WIN32
+        s_Roundtrip.setInputNeutralize =
+            (void(*)(int))GetProcAddress((HMODULE)coreHandle, "core_set_input_neutralize");
+        s_Roundtrip.setRollbackMode =
+            (void(*)(int))GetProcAddress((HMODULE)coreHandle, "core_set_rollback_mode");
+#else
+        s_Roundtrip.setInputNeutralize =
+            (void(*)(int))dlsym(coreHandle, "core_set_input_neutralize");
+        s_Roundtrip.setRollbackMode =
+            (void(*)(int))dlsym(coreHandle, "core_set_rollback_mode");
+#endif
+    }
+
+    s_Roundtrip.phase = RoundtripPhase::Settle;
+    s_Roundtrip.frameInPhase = 0;
+    s_Roundtrip.savedSpeedLimiter = false;
+
+    /* If advance < hold, skip the hold (second leg would otherwise overshoot). */
+    s_Roundtrip.holdFrames = (s_Roundtrip.advanceFrames < kRoundtripHoldFrames)
+        ? 0 : kRoundtripHoldFrames;
+
+    const char* rollbackStatus = s_Roundtrip.rollbackEnable
+        ? (s_Roundtrip.setRollbackMode
+              ? "ENABLED (silent re-simulation, no video/audio output)"
+              : "REQUESTED but UNAVAILABLE (core_set_rollback_mode not exported)")
+        : "off (default)";
+
+    char buf[640];
+    if (s_Roundtrip.mode == 1)
+    {
+        snprintf(buf, sizeof(buf),
+            "[FrameZero roundtrip] Armed (REVERSIBILITY mode). Snapshot=%zu bytes. Plan: settle %d (%.1fs — play normally) -> capture0 -> RESTORE0 -> capture3 -> compare 0 vs 3. Input neutralization: %s. Rollback mode: %s.",
+            FrameZero::stateSnapshotSize(),
+            s_Roundtrip.settleFrames, s_Roundtrip.settleFrames / 60.0,
+            s_Roundtrip.setInputNeutralize ? "enabled" : "UNAVAILABLE",
+            rollbackStatus);
+    }
+    else
+    {
+        snprintf(buf, sizeof(buf),
+            "[FrameZero roundtrip] Armed. Snapshot=%zu bytes. Plan: settle %d (%.1fs — play normally) -> capture0 -> advance %d -> capture1 -> RESTORE0 -> hold %d -> advance %d -> capture2 -> compare. Input neutralization: %s. Rollback mode: %s.",
+            FrameZero::stateSnapshotSize(),
+            s_Roundtrip.settleFrames, s_Roundtrip.settleFrames / 60.0,
+            s_Roundtrip.advanceFrames, s_Roundtrip.holdFrames, s_Roundtrip.advanceFrames,
+            s_Roundtrip.setInputNeutralize ? "enabled (your inputs ignored during advance phases)"
+                                           : "UNAVAILABLE — rebuild mupen64plus-core, or hold still during advance phases",
+            rollbackStatus);
+    }
+    CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
+}
+
+static void RoundtripDisarm()
+{
+    RoundtripRestoreLimiter();
+    if (s_Roundtrip.setInputNeutralize)
+        s_Roundtrip.setInputNeutralize(0);
+    if (s_Roundtrip.setRollbackMode)
+        s_Roundtrip.setRollbackMode(0);
+    FrameZero::stateShutdown();
+    s_Roundtrip.phase = RoundtripPhase::Done;
+}
+
+/* Diff two slots and log a structured report. Returns number of differing bytes. */
+static size_t RoundtripDiffSlots(int slotA, int slotB, const char* label)
+{
+    if (!FrameZero::slotIsValid(slotA) || !FrameZero::slotIsValid(slotB))
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Error,
+            "[FrameZero roundtrip] internal error: slots not valid for compare");
+        return SIZE_MAX;
+    }
+
+    const uint8_t* buf_a = nullptr; size_t len_a = 0;
+    const uint8_t* buf_b = nullptr; size_t len_b = 0;
+    if (!FrameZero::slotBytes(slotA, &buf_a, &len_a) ||
+        !FrameZero::slotBytes(slotB, &buf_b, &len_b))
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Error,
+            "[FrameZero roundtrip] slotBytes() failed for compare");
+        return SIZE_MAX;
+    }
+
+    char buf[256];
+
+    if (len_a != len_b)
+    {
+        snprintf(buf, sizeof(buf),
+            "[FrameZero roundtrip] FAIL (%s): state size differs — slot%d=%zu  slot%d=%zu",
+            label, slotA, len_a, slotB, len_b);
+        CoreAddCallbackMessage(CoreDebugMessageType::Error, std::string(buf));
+        return SIZE_MAX;
+    }
+
+    size_t numDiff = 0;
+    struct Range { size_t start; size_t end; };
+    std::vector<Range> ranges;
+    for (size_t i = 0; i < len_a; ++i)
+    {
+        if (buf_a[i] != buf_b[i])
+        {
+            ++numDiff;
+            if (!ranges.empty() && ranges.back().end == i)
+                ranges.back().end = i + 1;
+            else
+                ranges.push_back({i, i + 1});
+        }
+    }
+
+    if (numDiff == 0)
+    {
+        snprintf(buf, sizeof(buf),
+            "[FrameZero roundtrip] PASS (%s): %zu-byte snapshots identical (slot%d == slot%d)",
+            label, len_a, slotA, slotB);
+        CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
+        return 0;
+    }
+
+    snprintf(buf, sizeof(buf),
+        "[FrameZero roundtrip] FAIL (%s): %zu/%zu bytes differ across %zu range(s) (slot%d vs slot%d). Listing up to 16:",
+        label, numDiff, len_a, ranges.size(), slotA, slotB);
+    CoreAddCallbackMessage(CoreDebugMessageType::Error, std::string(buf));
+
+    const size_t maxList = std::min<size_t>(ranges.size(), 16);
+    for (size_t r = 0; r < maxList; ++r)
+    {
+        const size_t s = ranges[r].start;
+        const size_t e = ranges[r].end;
+        const size_t n = e - s;
+        char a_hex[40] = {0}, b_hex[40] = {0};
+        const size_t showN = std::min<size_t>(n, 8);
+        char* ap = a_hex; char* bp = b_hex;
+        for (size_t k = 0; k < showN; ++k)
+        {
+            ap += snprintf(ap, sizeof(a_hex) - (ap - a_hex), "%02x ", buf_a[s + k]);
+            bp += snprintf(bp, sizeof(b_hex) - (bp - b_hex), "%02x ", buf_b[s + k]);
+        }
+        snprintf(buf, sizeof(buf),
+            "  [%zu] offset=0x%zx (%zu) len=%zu  slot%d: %s  slot%d: %s",
+            r, s, s, n, slotA, a_hex, slotB, b_hex);
+        CoreAddCallbackMessage(CoreDebugMessageType::Error, std::string(buf));
+    }
+    return numDiff;
+}
+
+static void RoundtripCompare()
+{
+    char label[64];
+    snprintf(label, sizeof(label), "ADVANCE %d frames per leg",
+             s_Roundtrip.advanceFrames);
+    RoundtripDiffSlots(1, 2, label);
+}
+
+static void RoundtripTick()
+{
+    if (s_Roundtrip.phase == RoundtripPhase::Disabled ||
+        s_Roundtrip.phase == RoundtripPhase::Done)
+        return;
+
+    char logbuf[256];
+
+    switch (s_Roundtrip.phase)
+    {
+        case RoundtripPhase::Settle:
+            if (++s_Roundtrip.frameInPhase >= s_Roundtrip.settleFrames) {
+                /* Take ownership of the speed limiter for the rest of the test
+                 * so the visual rewind isn't fast-forwarded out of existence. */
+                RoundtripForceLimiterOn();
+                /* Engage input neutralization at end of Settle, before capture.
+                 * Both legs of the test will then see all-zero controller input
+                 * regardless of what the user is pressing. */
+                if (s_Roundtrip.setInputNeutralize)
+                    s_Roundtrip.setInputNeutralize(1);
+                /* Optionally engage rollback-mode (suppresses GFX updateScreen
+                 * and audio push_samples side effects). Both legs see the
+                 * same suppression so the comparison is unaffected; this
+                 * exercises the production rollback wiring end-to-end. */
+                bool rollbackOn = false;
+                if (s_Roundtrip.rollbackEnable && s_Roundtrip.setRollbackMode) {
+                    s_Roundtrip.setRollbackMode(1);
+                    rollbackOn = true;
+                }
+                CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                    s_Roundtrip.setInputNeutralize
+                        ? (rollbackOn
+                              ? "[FrameZero roundtrip] Settle done. Speed limiter forced ON. INPUT NEUTRALIZED. ROLLBACK MODE ENGAGED (no video/audio output during test)."
+                              : "[FrameZero roundtrip] Settle done. Speed limiter forced ON. INPUT NEUTRALIZED — your buttons are ignored until the test completes.")
+                        : "[FrameZero roundtrip] Settle done. Speed limiter forced ON. (input neutralization unavailable — DO NOT press any buttons.)");
+                s_Roundtrip.phase = RoundtripPhase::Capture0;
+                s_Roundtrip.frameInPhase = 0;
+            }
+            break;
+
+        case RoundtripPhase::Capture0:
+            if (s_Roundtrip.mode == 1) {
+                /* Reversibility test: capture slot 0, restore slot 0, capture
+                 * slot 3 — ALL in this single tick so no emulation runs
+                 * between them. If slot 0 != slot 3, the load path doesn't
+                 * fully restore something the save path reads (or load has
+                 * a side-effect that mutates state the next save reads). */
+                if (!FrameZero::captureState(0)) {
+                    CoreAddCallbackMessage(CoreDebugMessageType::Error,
+                        "[FrameZero roundtrip] reversibility: capture slot 0 failed");
+                    RoundtripDisarm();
+                    break;
+                }
+                s_Roundtrip.frameAtCapture0 = s_CurrentFrame;
+
+                if (!FrameZero::restoreState(0)) {
+                    CoreAddCallbackMessage(CoreDebugMessageType::Error,
+                        "[FrameZero roundtrip] reversibility: restore slot 0 failed");
+                    RoundtripDisarm();
+                    break;
+                }
+
+                if (!FrameZero::captureState(3)) {
+                    CoreAddCallbackMessage(CoreDebugMessageType::Error,
+                        "[FrameZero roundtrip] reversibility: capture slot 3 failed");
+                    RoundtripDisarm();
+                    break;
+                }
+
+                snprintf(logbuf, sizeof(logbuf),
+                    "[FrameZero roundtrip] REVERSIBILITY done in one tick at emulator frame %u (no emulation between save→load→save). Comparing slot 0 vs slot 3…",
+                    s_Roundtrip.frameAtCapture0);
+                CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(logbuf));
+
+                size_t diff = RoundtripDiffSlots(0, 3, "REVERSIBILITY save+restore (no emulation between)");
+                if (diff == 0) {
+                    CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                        "[FrameZero roundtrip] Reversibility passed — every byte the save path reads is also written by the load path. Any advance-test failure is therefore from non-deterministic emulator execution, not missing state.");
+                } else if (diff != SIZE_MAX) {
+                    CoreAddCallbackMessage(CoreDebugMessageType::Error,
+                        "[FrameZero roundtrip] Reversibility FAILED — listed offsets show fields read by save but not restored by load (or mutated by load as a side-effect). These are the next things to fix.");
+                }
+                CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                    "[FrameZero roundtrip] Done. Speed limiter restored.");
+                RoundtripDisarm();
+            } else if (FrameZero::captureState(0)) {
+                s_Roundtrip.frameAtCapture0 = s_CurrentFrame;
+                snprintf(logbuf, sizeof(logbuf),
+                    "[FrameZero roundtrip] Captured slot 0 at emulator frame %u. Advancing %d frames (~%.2fs game time)…",
+                    s_Roundtrip.frameAtCapture0, s_Roundtrip.advanceFrames, s_Roundtrip.advanceFrames / 60.0);
+                CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(logbuf));
+                s_Roundtrip.phase = RoundtripPhase::AdvanceFirst;
+                s_Roundtrip.frameInPhase = 0;
+            } else {
+                CoreAddCallbackMessage(CoreDebugMessageType::Error,
+                    "[FrameZero roundtrip] capture slot 0 failed");
+                RoundtripDisarm();
+            }
+            break;
+
+        case RoundtripPhase::AdvanceFirst:
+            if (++s_Roundtrip.frameInPhase >= s_Roundtrip.advanceFrames) {
+                s_Roundtrip.phase = RoundtripPhase::Capture1;
+                s_Roundtrip.frameInPhase = 0;
+            }
+            break;
+
+        case RoundtripPhase::Capture1:
+            if (FrameZero::captureState(1)) {
+                s_Roundtrip.frameAtCapture1 = s_CurrentFrame;
+                snprintf(logbuf, sizeof(logbuf),
+                    "[FrameZero roundtrip] Captured slot 1 at emulator frame %u (advanced %u frames). Restoring slot 0 — WATCH THE SCREEN…",
+                    s_Roundtrip.frameAtCapture1,
+                    s_Roundtrip.frameAtCapture1 - s_Roundtrip.frameAtCapture0);
+                CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(logbuf));
+                s_Roundtrip.phase = RoundtripPhase::Restore0;
+                s_Roundtrip.frameInPhase = 0;
+            } else {
+                CoreAddCallbackMessage(CoreDebugMessageType::Error,
+                    "[FrameZero roundtrip] capture slot 1 failed");
+                RoundtripDisarm();
+            }
+            break;
+
+        case RoundtripPhase::Restore0:
+        {
+            unsigned int beforeRestore = s_CurrentFrame;
+            if (FrameZero::restoreState(0)) {
+                s_Roundtrip.frameAtRestore = beforeRestore;
+                snprintf(logbuf, sizeof(logbuf),
+                    "[FrameZero roundtrip] Restored slot 0. Was at emulator frame %u. Holding %d frames so you can see the rewound state…",
+                    beforeRestore, s_Roundtrip.holdFrames);
+                CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(logbuf));
+                /* If holdFrames==0, skip PostRestoreHold entirely — otherwise
+                 * the increment-then-check pattern in PostRestoreHold burns 1
+                 * frame even at holdFrames=0, making leg 2 advance 1 more frame
+                 * than leg 1 and breaking the byte-identical comparison. */
+                s_Roundtrip.phase = (s_Roundtrip.holdFrames > 0)
+                    ? RoundtripPhase::PostRestoreHold
+                    : RoundtripPhase::AdvanceSecond;
+                s_Roundtrip.frameInPhase = 0;
+            } else {
+                CoreAddCallbackMessage(CoreDebugMessageType::Error,
+                    "[FrameZero roundtrip] restore slot 0 failed");
+                RoundtripDisarm();
+            }
+            break;
+        }
+
+        case RoundtripPhase::PostRestoreHold:
+            if (s_Roundtrip.frameInPhase == 0) {
+                /* First frame after the restore — emulator frame counter should
+                 * have jumped back to ~Capture0 if the savestate carries it. */
+                snprintf(logbuf, sizeof(logbuf),
+                    "[FrameZero roundtrip] First frame post-restore: emulator frame=%u (was %u just before restore — Δ=%d). Now re-advancing…",
+                    s_CurrentFrame, s_Roundtrip.frameAtRestore,
+                    (int)s_CurrentFrame - (int)s_Roundtrip.frameAtRestore);
+                CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(logbuf));
+            }
+            if (++s_Roundtrip.frameInPhase >= s_Roundtrip.holdFrames) {
+                s_Roundtrip.phase = RoundtripPhase::AdvanceSecond;
+                s_Roundtrip.frameInPhase = 0;
+            }
+            break;
+
+        case RoundtripPhase::AdvanceSecond:
+            /* PostRestoreHold also advances emulation (holdFrames), so this leg
+             * only needs (advanceFrames - holdFrames) more frames to match the
+             * first leg's total advance from Capture0. */
+            if (++s_Roundtrip.frameInPhase >= (s_Roundtrip.advanceFrames - s_Roundtrip.holdFrames)) {
+                s_Roundtrip.phase = RoundtripPhase::Capture2;
+                s_Roundtrip.frameInPhase = 0;
+            }
+            break;
+
+        case RoundtripPhase::Capture2:
+            if (FrameZero::captureState(2)) {
+                snprintf(logbuf, sizeof(logbuf),
+                    "[FrameZero roundtrip] Captured slot 2 at emulator frame %u. Comparing slot 1 vs slot 2…",
+                    s_CurrentFrame);
+                CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(logbuf));
+                s_Roundtrip.phase = RoundtripPhase::Compare;
+            } else {
+                CoreAddCallbackMessage(CoreDebugMessageType::Error,
+                    "[FrameZero roundtrip] capture slot 2 failed");
+                RoundtripDisarm();
+            }
+            break;
+
+        case RoundtripPhase::Compare:
+            RoundtripCompare();
+            CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                "[FrameZero roundtrip] Done. Speed limiter restored.");
+            RoundtripDisarm();
+            break;
+
+        default:
+            break;
+    }
+}
+
+} // namespace
+
 
 #ifdef NETPLAY
 // Maximum players supported by Kaillera
@@ -92,6 +845,12 @@ static void FrameCallback(unsigned int frameIndex)
     // This ensures we sync exactly once per frame regardless of PIF polling timing
     s_SyncedThisFrame = false;
 #endif
+
+    // Frame Zero Phase 0.5 spike (no-op unless FRAME_ZERO_SPIKE=1)
+    SpikeTick();
+
+    // Frame Zero Phase 1 roundtrip test (no-op unless FRAME_ZERO_ROUNDTRIP=1)
+    RoundtripTick();
 }
 
 // Kaillera PIF sync callback (called from mupen64plus-core after netplay sync)
@@ -507,6 +1266,13 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
         // Register frame callback for frame counter (used by Kaillera)
         s_CurrentFrame = 0;
         m64p::Core.DoCommand(M64CMD_SET_FRAME_CALLBACK, 0, (void*)FrameCallback);
+
+        // Frame Zero Phase 0.5 spike (no-op unless FRAME_ZERO_SPIKE=1).
+        // Must run after Core handle is valid and before M64CMD_EXECUTE.
+        SpikeArm();
+
+        // Frame Zero Phase 1 roundtrip test (no-op unless FRAME_ZERO_ROUNDTRIP=1).
+        RoundtripArm();
 
 #ifdef NETPLAY
         // Reset Kaillera sync state to prevent stale cache from previous sessions
