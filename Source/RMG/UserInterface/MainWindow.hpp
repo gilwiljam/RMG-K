@@ -148,6 +148,12 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
 
     bool ui_CheckRaphnetPluginMismatchPending = false;
 
+    /* Frame Zero pre-emulation connect — set in Init() if
+     * FRAME_ZERO_ONLINE=1 env var was found at startup. showEvent()
+     * schedules the connect attempt after a delay. */
+    bool ui_FrameZeroConnectPending = false;
+    QTimer* ui_FrameZeroPollTimer  = nullptr;
+
     void closeEvent(QCloseEvent *) Q_DECL_OVERRIDE;
 
     void initializeUI(bool launchROM);
@@ -198,6 +204,13 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
     void tryAutoStartNetplayOnStartup(void);
     void refreshKailleraRecordingStorageStatus(bool showStartupWarning);
 #endif // NETPLAY
+
+    /* Frame Zero pre-emulation connect (env-var driven). Triggered
+     * from showEvent() when FRAME_ZERO_ONLINE=1; opens a UDP socket,
+     * handshakes with the configured peer, then on success looks up
+     * the matching ROM by internal name and starts emulation. */
+    void tryFrameZeroConnect(void);
+    void pollFrameZeroConnectStatus(void);
   protected:
     void showEvent(QShowEvent *event) Q_DECL_OVERRIDE;
     void timerEvent(QTimerEvent *event) Q_DECL_OVERRIDE;

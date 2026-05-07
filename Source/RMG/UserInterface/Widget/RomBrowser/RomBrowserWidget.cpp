@@ -403,6 +403,56 @@ void RomBrowserWidget::SetToggleSearch(void)
     }
 }
 
+QString RomBrowserWidget::FindRomByInternalName(QString internalName)
+{
+    QPair<QStandardItemModel*, QSortFilterProxyModel*> model = this->getCurrentModel();
+    if (model.first == nullptr || internalName.isEmpty())
+    {
+        return QString();
+    }
+
+    auto normalize = [](const QString& s) -> QString {
+        QString out = s;
+        out = out.remove(QRegularExpression("[^a-zA-Z0-9]"));
+        return out.toLower();
+    };
+    const QString needle = normalize(internalName);
+    if (needle.isEmpty())
+    {
+        return QString();
+    }
+
+    /* Pass 1: exact (normalised) match. */
+    for (int i = 0; i < model.first->rowCount(); ++i)
+    {
+        RomBrowserModelData modelData =
+            model.first->item(i)->data().value<RomBrowserModelData>();
+        if (modelData.type != CoreRomType::Cartridge) continue;
+        QString romName = QString::fromStdString(modelData.header.Name);
+        if (normalize(romName) == needle)
+        {
+            return modelData.file;
+        }
+    }
+
+    /* Pass 2: substring match — handles "SMASH BROTHERS" matching
+     * a header that's e.g. "SMASH BROTHERS" with trailing nulls. */
+    for (int i = 0; i < model.first->rowCount(); ++i)
+    {
+        RomBrowserModelData modelData =
+            model.first->item(i)->data().value<RomBrowserModelData>();
+        if (modelData.type != CoreRomType::Cartridge) continue;
+        QString romName = QString::fromStdString(modelData.header.Name);
+        QString normalised = normalize(romName);
+        if (normalised.contains(needle) || needle.contains(normalised))
+        {
+            return modelData.file;
+        }
+    }
+
+    return QString();
+}
+
 QMap<QString, CoreRomSettings> RomBrowserWidget::GetModelData(void)
 {
     QMap<QString, CoreRomSettings> data;

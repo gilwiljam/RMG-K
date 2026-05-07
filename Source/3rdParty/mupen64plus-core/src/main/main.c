@@ -1838,15 +1838,40 @@ m64p_error main_run(void)
     //rand() is host-process state and is NOT captured in savestates, so any random
     //interrupt jitter would diverge across save/restore cycles — fatal for rollback.
     {
-        const char* fz_roundtrip = getenv("FRAME_ZERO_ROUNDTRIP");
-        int fz_active = (fz_roundtrip != NULL && fz_roundtrip[0] != '\0' && fz_roundtrip[0] != '0');
+        /* Force randomize_interrupt off whenever ANY Frame Zero env-var
+         * harness is in play. Critical for online sessions: the settle
+         * period between emulation start and session-open MUST be
+         * deterministic byte-for-byte across both peers, otherwise
+         * they begin GekkoNet's session at divergent emulator states
+         * and desync immediately. */
+        static const char* const fz_envs[] = {
+            "FRAME_ZERO_ROUNDTRIP",
+            "FRAME_ZERO_STRESS",
+            "FRAME_ZERO_ONLINE",
+            "FRAME_ZERO_SPIKE",
+            NULL,
+        };
+        const char* fz_active_var = NULL;
+        const char* fz_active_val = NULL;
+        for (size_t fi = 0; fz_envs[fi] != NULL; ++fi)
+        {
+            const char* v = getenv(fz_envs[fi]);
+            if (v != NULL && v[0] != '\0' && v[0] != '0')
+            {
+                fz_active_var = fz_envs[fi];
+                fz_active_val = v;
+                break;
+            }
+        }
+        int fz_active = (fz_active_var != NULL);
         randomize_interrupt = (!netplay_is_init() && !fz_active)
             ? ConfigGetParamBool(g_CoreConfig, "RandomizeInterrupt")
             : 0;
         DebugMessage(M64MSG_INFO,
-            "[FrameZero] randomize_interrupt=%d (netplay=%d fz_active=%d FRAME_ZERO_ROUNDTRIP=%s)",
+            "[FrameZero] randomize_interrupt=%d (netplay=%d fz_active=%d %s=%s)",
             randomize_interrupt, netplay_is_init() ? 1 : 0, fz_active,
-            fz_roundtrip ? fz_roundtrip : "(unset)");
+            fz_active_var ? fz_active_var : "(none)",
+            fz_active_val ? fz_active_val : "(unset)");
     }
     count_per_op = ConfigGetParamInt(g_CoreConfig, "CountPerOp");
     count_per_op_denom_pot = ConfigGetParamInt(g_CoreConfig, "CountPerOpDenomPot");

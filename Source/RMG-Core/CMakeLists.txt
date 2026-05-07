@@ -40,6 +40,7 @@ set(RMG_CORE_SOURCES
     Netplay.cpp
     Kaillera.cpp
     FrameZero.cpp
+    FrameZeroConnect.cpp
     FrameZeroState.cpp
     Plugins.cpp
     Version.cpp

@@ -1,12 +1,3 @@
-/*
- * Rosalie's Mupen GUI - https://github.com/Rosalie241/RMG
- * Copyright (C) 2020 Rosalie Wanders <rosalie@mailbox.org>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 3.
- * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <https://www.gnu.org/licenses/>.
- */
 #ifndef CORE_FRAMEZERO_HPP
 #define CORE_FRAMEZERO_HPP
 
@@ -56,6 +47,18 @@ CORE_EXPORT bool CoreShutdownFrameZero(void);
 // True if Init succeeded and GekkoNet is usable.
 CORE_EXPORT bool CoreHasInitFrameZero(void);
 
+// Pre-arm the Frame Zero subsystem before any frame runs. Registers
+// the PIF sync callback in "neutralize" mode so every controller
+// channel returns "controller present, no buttons" until a session
+// opens. Critical for cross-instance determinism — without this, two
+// peers' input plugins poll real hardware (USB adapters, etc.)
+// differently and the savestate captured at session-open has
+// host-dependent bytes, producing immediate desync at frame 0.
+//
+// Idempotent. Returns true on success. Call from emulation start when
+// FRAME_ZERO_ONLINE is set, before M64CMD_EXECUTE.
+CORE_EXPORT bool CoreFrameZeroPreArm(void);
+
 // Start a local stress-test session. Both actors are GekkoLocalPlayer;
 // no networking. GekkoNet drives save/load/advance events as if it were
 // a real rollback session, which exercises the determinism gate.
@@ -63,6 +66,26 @@ CORE_EXPORT bool CoreHasInitFrameZero(void);
 // num_players: 1..4 (typically 2 for SSB64 testing)
 // Returns true on session create + start success.
 CORE_EXPORT bool CoreStartFrameZeroStressSession(int num_players);
+
+// Start an online (P2P) session over GekkoNet's built-in UDP/ASIO
+// transport. One slot is the local player; the rest are remote.
+//
+// num_players:        total slot count (2..4 supported)
+// local_player_index: 0..num_players-1, identifies which slot is local
+// local_port:         UDP port to bind on this machine
+// remote_addrs:       num_players entries; the local slot's entry is
+//                     ignored, the others must be "host:port" strings
+//                     in any standard form (e.g., "192.168.1.42:7000").
+// input_delay:        local delay frames (typical 1..3 for fightig
+//                     games; 0 for no artificial delay)
+//
+// Returns true on session create + start. Caller must subsequently
+// drive emulation; the pump thread handles per-frame I/O.
+CORE_EXPORT bool CoreStartFrameZeroOnlineSession(int num_players,
+                                                 int local_player_index,
+                                                 unsigned short local_port,
+                                                 const std::string* remote_addrs,
+                                                 int input_delay);
 
 // End the current session, regardless of mode. Idempotent.
 CORE_EXPORT bool CoreEndFrameZeroSession(void);

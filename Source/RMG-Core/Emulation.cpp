@@ -31,6 +31,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 // Windows/POSIX dynamic loading
@@ -403,6 +404,19 @@ static void RoundtripArm()
     {
         s_Roundtrip.phase = RoundtripPhase::Disabled;
         return;
+    }
+
+    /* Roundtrip injects a forced state restore mid-emulation, which
+     * destroys any concurrent online session. Online wins. */
+    if (const char* o = std::getenv("FRAME_ZERO_ONLINE"))
+    {
+        if (o[0] != '\0' && o[0] != '0')
+        {
+            CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+                "[FrameZero roundtrip] Skipped — FRAME_ZERO_ONLINE is set; the in-place restore would break the netplay session.");
+            s_Roundtrip.phase = RoundtripPhase::Disabled;
+            return;
+        }
     }
 
     if (!FrameZero::stateInit())
@@ -882,6 +896,19 @@ static void StressArm()
         return;
     }
 
+    /* Stress and Online share the same g_session global; both arming
+     * simultaneously corrupts the session lifecycle. Online wins. */
+    if (const char* o = std::getenv("FRAME_ZERO_ONLINE"))
+    {
+        if (o[0] != '\0' && o[0] != '0')
+        {
+            CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+                "[FrameZero stress] Skipped — FRAME_ZERO_ONLINE is set, online session takes the slot.");
+            s_Stress.phase = StressPhase::Disabled;
+            return;
+        }
+    }
+
 #ifndef FRAME_ZERO
     CoreAddCallbackMessage(CoreDebugMessageType::Warning,
         "[FrameZero stress] FRAME_ZERO_STRESS=1 but build does not include FRAME_ZERO support. Test disabled.");
@@ -969,6 +996,208 @@ static void StressTick()
 #endif
 }
 
+//
+// Phase 4 online-session harness — direct-IP P2P over GekkoNet's UDP.
+//
+// FRAME_ZERO_ONLINE=1            enables (any non-empty non-zero)
+// FRAME_ZERO_ONLINE_LOCAL=N      local player slot (0..3, default 0)
+// FRAME_ZERO_ONLINE_PORT=N       local UDP port (default 7000)
+// FRAME_ZERO_ONLINE_PEERS=...    comma-separated host:port for each
+//                                 remote slot, in slot order. The
+//                                 local slot's entry is ignored but
+//                                 must be present (use "0" placeholder).
+//                                 Example for 2-player local=0:
+//                                     "0,192.168.1.42:7000"
+// FRAME_ZERO_ONLINE_PLAYERS=N    total slot count (2..4, default 2)
+// FRAME_ZERO_ONLINE_DELAY=N      input delay frames (0..9, default 2)
+// FRAME_ZERO_ONLINE_SETTLE=N     settle frames before connect (default 600)
+//
+
+enum class OnlinePhase
+{
+    Disabled,
+    Settle,
+    Running,
+    Done,
+};
+
+constexpr int kOnlineSettleFramesDefault = 1;
+constexpr int kOnlinePlayersDefault      = 2;
+constexpr int kOnlineLocalDefault        = 0;
+constexpr unsigned short kOnlinePortDefault = 7000;
+constexpr int kOnlineDelayDefault        = 2;
+
+struct OnlineState
+{
+    OnlinePhase phase    = OnlinePhase::Disabled;
+    int settleFrames     = kOnlineSettleFramesDefault;
+    int frameInPhase     = 0;
+    int players          = kOnlinePlayersDefault;
+    int localIdx         = kOnlineLocalDefault;
+    int delay            = kOnlineDelayDefault;
+    unsigned short port  = kOnlinePortDefault;
+    std::vector<std::string> peers;
+};
+
+static OnlineState s_Online;
+
+static void OnlineArm()
+{
+    const char* env = std::getenv("FRAME_ZERO_ONLINE");
+    if (env == nullptr || env[0] == '\0' || env[0] == '0')
+    {
+        s_Online.phase = OnlinePhase::Disabled;
+        return;
+    }
+
+#ifndef FRAME_ZERO
+    CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+        "[FrameZero online] FRAME_ZERO_ONLINE=1 but build does not include FRAME_ZERO support. Disabled.");
+    s_Online.phase = OnlinePhase::Disabled;
+    return;
+#else
+    s_Online.players  = parse_env_int("FRAME_ZERO_ONLINE_PLAYERS", kOnlinePlayersDefault, 2);
+    if (s_Online.players > 4) s_Online.players = 4;
+    s_Online.localIdx = parse_env_int("FRAME_ZERO_ONLINE_LOCAL",   kOnlineLocalDefault, 0);
+    if (s_Online.localIdx >= s_Online.players) s_Online.localIdx = 0;
+    s_Online.delay    = parse_env_int("FRAME_ZERO_ONLINE_DELAY",   kOnlineDelayDefault, 0);
+    if (s_Online.delay > 9) s_Online.delay = 9;
+    s_Online.settleFrames = parse_env_int("FRAME_ZERO_ONLINE_SETTLE",
+                                           kOnlineSettleFramesDefault, 1);
+    s_Online.port = (unsigned short)parse_env_int("FRAME_ZERO_ONLINE_PORT",
+                                                  (int)kOnlinePortDefault, 1);
+
+    /* Parse peers env. We accept two formats:
+     *   1. Slot-positional: N entries for N players, local slot is a
+     *      placeholder (e.g. "0" or empty). Required for 3+ players.
+     *   2. Remotes-only:    N-1 entries listing only the remote slots
+     *      in slot order, skipping the local slot. Convenient for the
+     *      common 2-player case where there is only one remote.
+     * We pick the format by entry count. Anything else is positional
+     * with whatever entries we got (trailing slots empty). */
+    s_Online.peers.assign(s_Online.players, std::string{});
+    std::vector<std::string> raw_entries;
+    const char* peers_env = std::getenv("FRAME_ZERO_ONLINE_PEERS");
+    if (peers_env != nullptr && peers_env[0] != '\0')
+    {
+        std::string raw(peers_env);
+        size_t start = 0;
+        for (size_t pos = 0; pos <= raw.size(); ++pos)
+        {
+            if (pos == raw.size() || raw[pos] == ',')
+            {
+                raw_entries.push_back(raw.substr(start, pos - start));
+                start = pos + 1;
+            }
+        }
+    }
+
+    if ((int)raw_entries.size() == s_Online.players - 1)
+    {
+        /* Remotes-only: drop into every non-local slot in order. */
+        size_t r = 0;
+        for (int i = 0; i < s_Online.players; ++i)
+        {
+            if (i == s_Online.localIdx) continue;
+            s_Online.peers[i] = raw_entries[r++];
+        }
+    }
+    else
+    {
+        /* Positional. */
+        for (int i = 0; i < s_Online.players && i < (int)raw_entries.size(); ++i)
+        {
+            s_Online.peers[i] = raw_entries[i];
+        }
+    }
+
+    s_Online.phase = OnlinePhase::Settle;
+    s_Online.frameInPhase = 0;
+
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "[FrameZero online] Armed. settle=%d, players=%d, local=%d, port=%u, delay=%d.",
+        s_Online.settleFrames, s_Online.players, s_Online.localIdx,
+        (unsigned)s_Online.port, s_Online.delay);
+    CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
+
+    /* Log the resolved slot map so peer-address mistakes are obvious
+     * at boot time rather than as a silent freeze 10 seconds later. */
+    for (int i = 0; i < s_Online.players; ++i)
+    {
+        const char* role = (i == s_Online.localIdx) ? "local" : "remote";
+        const std::string& addr = s_Online.peers[i];
+        const char* addr_str = (i == s_Online.localIdx)
+                                ? "(this machine)"
+                                : (addr.empty() ? "(EMPTY — peer will be unreachable)"
+                                                : addr.c_str());
+        std::snprintf(buf, sizeof(buf),
+            "[FrameZero online]   slot %d: %s -> %s", i, role, addr_str);
+        CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
+    }
+
+    /* Register the PIF callback in neutralize-mode so PIF rx_buf is
+     * host-independent from the very first joybus scan, well before
+     * the GekkoNet session opens. Without this, the savestate captured
+     * at session-open carries different bytes on each peer, causing
+     * desync at frame 0. */
+    if (!CoreFrameZeroPreArm())
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+            "[FrameZero online] CoreFrameZeroPreArm failed — pre-session inputs will not be neutralized; expect frame-0 desync.");
+    }
+#endif
+}
+
+static void OnlineTick()
+{
+#ifndef FRAME_ZERO
+    return;
+#else
+    if (s_Online.phase == OnlinePhase::Disabled || s_Online.phase == OnlinePhase::Done)
+        return;
+
+    switch (s_Online.phase)
+    {
+        case OnlinePhase::Settle:
+        {
+            ++s_Online.frameInPhase;
+            if (s_Online.frameInPhase >= s_Online.settleFrames)
+            {
+                if (!CoreInitFrameZero())
+                {
+                    CoreAddCallbackMessage(CoreDebugMessageType::Error,
+                        "[FrameZero online] CoreInitFrameZero failed — disabling test.");
+                    s_Online.phase = OnlinePhase::Done;
+                    break;
+                }
+                CoreEndFrameZeroSession();  /* idempotent cleanup */
+                if (!CoreStartFrameZeroOnlineSession(
+                        s_Online.players, s_Online.localIdx, s_Online.port,
+                        s_Online.peers.data(), s_Online.delay))
+                {
+                    CoreAddCallbackMessage(CoreDebugMessageType::Error,
+                        "[FrameZero online] CoreStartFrameZeroOnlineSession failed — disabling test.");
+                    s_Online.phase = OnlinePhase::Done;
+                    break;
+                }
+                s_Online.phase = OnlinePhase::Running;
+                s_Online.frameInPhase = 0;
+                CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                    "[FrameZero online] Session started. Waiting for peer + GekkoSessionStarted event…");
+            }
+            break;
+        }
+        case OnlinePhase::Running:
+            /* Online session runs until user stops emulation. We don't
+             * auto-end at a frame target; let the match play out. */
+            break;
+        default:
+            break;
+    }
+#endif
+}
+
 } // namespace
 
 
@@ -1003,6 +1232,9 @@ static void FrameCallback(unsigned int frameIndex)
 
     // Frame Zero Phase 3 stress test (no-op unless FRAME_ZERO_STRESS=N)
     StressTick();
+
+    // Frame Zero Phase 4 online session (no-op unless FRAME_ZERO_ONLINE=1)
+    OnlineTick();
 }
 
 // Kaillera PIF sync callback (called from mupen64plus-core after netplay sync)
@@ -1391,10 +1623,25 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
         apply_kaillera_deterministic_settings();
     }
 #ifdef FRAME_ZERO
-    // Same gates apply to Frame Zero rollback. Active session => apply.
-    if (CoreGetFrameZeroSessionMode() != CoreFrameZero::SessionMode::None)
+    // Apply Frame Zero deterministic settings whenever a session is
+    // active OR an env-var harness is enabled. Critical for online
+    // sessions: settle frames between emulation start and session
+    // open MUST be deterministic on both peers, otherwise their
+    // emulator states diverge before GekkoNet ever runs.
     {
-        apply_frame_zero_deterministic_settings();
+        bool fz_session_active = (CoreGetFrameZeroSessionMode() != CoreFrameZero::SessionMode::None);
+        auto env_set = [](const char* name) {
+            const char* v = std::getenv(name);
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        };
+        bool fz_env_active = env_set("FRAME_ZERO_ONLINE")
+                          || env_set("FRAME_ZERO_STRESS")
+                          || env_set("FRAME_ZERO_ROUNDTRIP")
+                          || env_set("FRAME_ZERO_SPIKE");
+        if (fz_session_active || fz_env_active)
+        {
+            apply_frame_zero_deterministic_settings();
+        }
     }
 #endif
 
@@ -1447,6 +1694,9 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
 
         // Frame Zero Phase 3 stress test (no-op unless FRAME_ZERO_STRESS=N).
         StressArm();
+
+        // Frame Zero Phase 4 online session (no-op unless FRAME_ZERO_ONLINE=1).
+        OnlineArm();
 
 #ifdef NETPLAY
         // Reset Kaillera sync state to prevent stale cache from previous sessions

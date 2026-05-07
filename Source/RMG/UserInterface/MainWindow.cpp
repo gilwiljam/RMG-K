@@ -35,6 +35,8 @@
 #include "Callbacks.hpp"
 #include "VidExt.hpp"
 
+#include <RMG-Core/FrameZeroConnect.hpp>
+
 #ifdef UPDATER
 #include <QNetworkAccessManager>
 #include <QJsonDocument>
@@ -295,6 +297,15 @@ bool MainWindow::Init(QApplication* app, bool showUI, bool launchROM)
     // Check for raphnet plugin mismatch after window is visible
     this->ui_CheckRaphnetPluginMismatchPending = showUI && !launchROM;
 
+    /* Frame Zero pre-emulation connect: kicked off from showEvent()
+     * after a configurable delay. Triggered only when the env-var
+     * harness is set and we aren't already auto-launching a ROM. */
+    {
+        const char* fz_online = std::getenv("FRAME_ZERO_ONLINE");
+        bool fz_active = (fz_online != nullptr && fz_online[0] != '\0' && fz_online[0] != '0');
+        this->ui_FrameZeroConnectPending = showUI && !launchROM && fz_active;
+    }
+
     return true;
 }
 
@@ -458,6 +469,10 @@ void MainWindow::closeEvent(QCloseEvent *event)
 
     this->ui_Widget_RomBrowser->StopRefreshRomList();
 
+    /* Tear down the Frame Zero pre-emulation handshake worker, if any,
+     * before we shut down the core callbacks it logs through. */
+    CoreFrameZeroConnectStop();
+
     this->coreCallBacks->Stop();
 
 #ifdef NETPLAY
@@ -527,6 +542,22 @@ void MainWindow::showEvent(QShowEvent *event)
         this->ui_CheckRaphnetPluginMismatchPending = false;
         QTimer::singleShot(0, this, [this]() {
             this->checkRaphnetPluginMismatch();
+        });
+    }
+
+    // Frame Zero pre-emulation connect — wait the configured delay
+    // (default 10s) then attempt UDP handshake with the configured peer.
+    if (this->ui_FrameZeroConnectPending)
+    {
+        this->ui_FrameZeroConnectPending = false;
+        int delay_ms = 10000;
+        if (const char* d = std::getenv("FRAME_ZERO_ONLINE_DELAY_MS"))
+        {
+            int v = std::atoi(d);
+            if (v >= 100) delay_ms = v;
+        }
+        QTimer::singleShot(delay_ms, this, [this]() {
+            this->tryFrameZeroConnect();
         });
     }
 }
@@ -3129,6 +3160,130 @@ void MainWindow::closeNetplayChatPrompt(void)
     OnScreenDisplaySetInputPrompt("");
 }
 #endif // NETPLAY
+
+void MainWindow::tryFrameZeroConnect(void)
+{
+    /* Gather config from env vars. */
+    auto getenv_int = [](const char* name, int dflt, int min_v) {
+        const char* v = std::getenv(name);
+        if (v == nullptr || v[0] == '\0') return dflt;
+        int parsed = std::atoi(v);
+        return parsed < min_v ? dflt : parsed;
+    };
+
+    int local_port_i = getenv_int("FRAME_ZERO_ONLINE_PORT", 7000, 1);
+    if (local_port_i > 65535) local_port_i = 7000;
+    unsigned short local_port = (unsigned short)local_port_i;
+
+    int timeout_seconds = getenv_int("FRAME_ZERO_ONLINE_TIMEOUT", 60, 5);
+
+    std::vector<std::string> peer_addrs;
+    if (const char* peers_env = std::getenv("FRAME_ZERO_ONLINE_PEERS"))
+    {
+        std::string raw(peers_env);
+        size_t start = 0;
+        for (size_t pos = 0; pos <= raw.size(); ++pos)
+        {
+            if (pos == raw.size() || raw[pos] == ',')
+            {
+                std::string entry = raw.substr(start, pos - start);
+                if (!entry.empty()) peer_addrs.push_back(entry);
+                start = pos + 1;
+            }
+        }
+    }
+
+    if (!CoreFrameZeroConnectStart(local_port, peer_addrs, timeout_seconds))
+    {
+        this->showErrorMessage("Frame Zero connect failed",
+            "Could not start the pre-emulation handshake. "
+            "Check FRAME_ZERO_ONLINE_PORT / FRAME_ZERO_ONLINE_PEERS env vars.");
+        return;
+    }
+
+    /* Poll status from the UI thread; on Connected we look up the ROM
+     * and launch emulation. 250 ms cadence is plenty — the worker
+     * thread does the actual handshake at 100 ms granularity. */
+    if (this->ui_FrameZeroPollTimer == nullptr)
+    {
+        this->ui_FrameZeroPollTimer = new QTimer(this);
+        connect(this->ui_FrameZeroPollTimer, &QTimer::timeout,
+                this, &MainWindow::pollFrameZeroConnectStatus);
+    }
+    this->ui_FrameZeroPollTimer->start(250);
+}
+
+void MainWindow::pollFrameZeroConnectStatus(void)
+{
+    using S = CoreFrameZero::ConnectStatus;
+    S status = CoreFrameZeroConnectGetStatus();
+
+    if (status == S::Connecting)
+        return;
+
+    /* Terminal state — stop polling no matter what. */
+    if (this->ui_FrameZeroPollTimer != nullptr)
+    {
+        this->ui_FrameZeroPollTimer->stop();
+    }
+
+    if (status == S::Connected)
+    {
+        /* If the user already kicked off emulation manually while we
+         * were handshaking, do not double-launch. The peer will see
+         * the established UDP path and the local emulator can still
+         * attach a session via the env-var harness. */
+        if (CoreIsEmulationRunning())
+        {
+            return;
+        }
+
+        /* Find the matching ROM by cartridge internal name. SSB64
+         * NTSC-U's internal name is "SMASH BROTHERS" — Phase 4
+         * minimum hard-codes that target. Eventually this'll come
+         * from a session config message rather than a constant. */
+        const QString internalName = "SMASH BROTHERS";
+        QString romFile = this->ui_Widget_RomBrowser->FindRomByInternalName(internalName);
+        if (romFile.isEmpty())
+        {
+            this->showErrorMessage("ROM Not Found",
+                "Frame Zero connect succeeded but no ROM matching "
+                "internal name \"" + internalName + "\" was found in your "
+                "ROM browser. Add SSB64 NTSC-U and refresh the list.");
+            CoreFrameZeroConnectStop();
+            return;
+        }
+
+        /* Set settle to 1 — connection is already established, no
+         * point waiting another 10 seconds before opening the
+         * GekkoNet session. */
+#ifdef _WIN32
+        _putenv_s("FRAME_ZERO_ONLINE_SETTLE", "1");
+#else
+        setenv("FRAME_ZERO_ONLINE_SETTLE", "1", 1);
+#endif
+
+        /* Launch emulation. The OnlineArm harness inside
+         * Emulation.cpp picks up the env vars and opens the GekkoNet
+         * session at frame 1. Both peers reach this point at near-
+         * identical wall-clock — boot deterministic + pump-driven
+         * park absorbs any skew. */
+        this->launchEmulationThread(romFile, "", false, -1, false);
+    }
+    else if (status == S::TimedOut)
+    {
+        this->showErrorMessage("Frame Zero connect timed out",
+            "Did not receive a HELLO/ACK from the peer in time. "
+            "Verify FRAME_ZERO_ONLINE_PEERS is correct on both sides "
+            "and that the UDP port isn't blocked.");
+    }
+    else if (status == S::Error)
+    {
+        this->showErrorMessage("Frame Zero connect error",
+            "UDP socket bind or I/O failure. "
+            "Check FRAME_ZERO_ONLINE_PORT for conflicts.");
+    }
+}
 
 QString MainWindow::findRomByName(QString gameName)
 {

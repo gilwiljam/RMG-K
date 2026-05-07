@@ -1,12 +1,3 @@
-/*
- * Rosalie's Mupen GUI - https://github.com/Rosalie241/RMG
- * Copyright (C) 2020 Rosalie Wanders <rosalie@mailbox.org>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 3.
- * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <https://www.gnu.org/licenses/>.
- */
 #define CORE_INTERNAL
 
 #include "FrameZero.hpp"
@@ -23,6 +14,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -108,6 +100,17 @@ int                             g_pump_call_count = 0;
  * advance fired. */
 bool                            g_pump_iter_advanced = false;
 
+/* Pre-session input neutralization. Set when CoreFrameZeroPreArm is
+ * called (before emulation runs). While set AND no GekkoNet session
+ * exists yet, the PIF callback overrides every controller channel to
+ * "controller present, no buttons pressed" so the savestate captured
+ * when the session opens does not encode host-specific PIF state.
+ * Without this, two peers' input plugins poll real hardware
+ * differently — for instance, only one window can grab a USB adapter
+ * at a time — and that asymmetry leaks into the first SaveEvent's
+ * snapshot bytes, producing immediate desync at frame 0. */
+std::atomic<bool>               g_neutralize_inputs{false};
+
 /* Mupen64plus-core resolved hooks. */
 typedef void (*set_pif_sync_callback_t)(fz_pif_sync_callback_t);
 typedef void (*core_set_frame_zero_pump_t)(fz_frame_zero_pump_t);
@@ -190,12 +193,66 @@ void fz_set_rollback(int mode)
 }
 
 /* PIF sync callback. Runs on the emulation thread for every PIF channel
- * scan. Stages the local input from channel 0 once per frame and
- * writes the cached synced inputs back to all channels. */
+ * scan. Two responsibilities:
+ *
+ *  1. Pre-session neutralization. While g_neutralize_inputs is set and
+ *     no GekkoNet session exists yet, override every controller channel
+ *     with a host-independent "controller present, all buttons zero"
+ *     response. This is critical for cross-instance determinism: only
+ *     one RMG-K instance can typically hold a USB HID adapter at a
+ *     time, so without this, two peers' input plugins write different
+ *     bytes into PIF rx_buf during boot and the savestate captured at
+ *     session-open has different bytes too — guaranteeing immediate
+ *     desync at frame 0.
+ *
+ *  2. Active-session sync. Stages the local input from channel 0 once
+ *     per frame for the pump to feed into GekkoNet, and writes the
+ *     synced inputs from the most recent AdvanceEvent back to all
+ *     channels. */
 void fz_pif_sync_callback(struct fz_pif* pif)
 {
-    if (g_session == nullptr || pif == nullptr)
+    if (pif == nullptr)
         return;
+
+    /* Pre-session: hard-neutralize every channel. We do not know yet
+     * how many players the session will have, so neutralize all four
+     * physical channels — boot code reads them all. */
+    if (g_session == nullptr)
+    {
+        if (!g_neutralize_inputs.load(std::memory_order_relaxed))
+            return;
+
+        for (int i = 0; i < 4; ++i)
+        {
+            if (pif->channels[i].tx == nullptr || pif->channels[i].rx == nullptr)
+                continue;
+
+            *pif->channels[i].rx &= ~0xC0;
+
+            const uint8_t cmd = pif->channels[i].tx_buf[0];
+            if (cmd == FZ_JCMD_STATUS || cmd == FZ_JCMD_RESET)
+            {
+                if (pif->channels[i].rx_buf != nullptr)
+                {
+                    const uint16_t type = 0x0500;  /* standard controller */
+                    pif->channels[i].rx_buf[0] = (uint8_t)(type & 0xFF);
+                    pif->channels[i].rx_buf[1] = (uint8_t)(type >> 8);
+                    pif->channels[i].rx_buf[2] = 0;
+                }
+            }
+            else if (cmd == FZ_JCMD_CONTROLLER_READ &&
+                     pif->channels[i].rx_buf != nullptr)
+            {
+                pif->channels[i].rx_buf[0] = 0;
+                pif->channels[i].rx_buf[1] = 0;
+                pif->channels[i].rx_buf[2] = 0;
+                pif->channels[i].rx_buf[3] = 0;
+            }
+        }
+        return;
+    }
+
+    /* Active session — same logic as before. */
 
     /* On the first JCMD_CONTROLLER_READ this frame, snapshot the local
      * input that the input plugin already wrote to channel 0's rx
@@ -282,6 +339,10 @@ static void fz_pump_one_frame(unsigned int current_frame)
     const bool log_this_call = g_pump_debug && (g_pump_call_count < kPumpDebugFrames);
     ++g_pump_call_count;
 
+    /* Drain inbound UDP packets for online sessions. No-op for
+     * StressSession (gekko_default_adapter not attached there). */
+    gekko_network_poll(g_session);
+
     /* Push staged local input into all local actors EVERY iteration —
      * GekkoNet expects this whether we have a fresh poll or not.
      * Before the first PIF poll fires (chicken-and-egg: emulation is
@@ -298,7 +359,7 @@ static void fz_pump_one_frame(unsigned int current_frame)
     }
 
     /* Drain session events: connection state, sync progress, desync
-     * detection. For Phase 3 we just log them. */
+     * detection. */
     int count = 0;
     GekkoSessionEvent** session_events = gekko_session_events(g_session, &count);
     for (int i = 0; i < count; ++i)
@@ -306,16 +367,44 @@ static void fz_pump_one_frame(unsigned int current_frame)
         GekkoSessionEvent* ev = session_events[i];
         if (ev == nullptr)
             continue;
-        if (ev->type == GekkoDesyncDetected)
+        char buf[192];
+        switch (ev->type)
         {
-            char buf[160];
-            std::snprintf(buf, sizeof(buf),
-                "[FrameZero] DESYNC frame=%d remote_handle=%d local_chk=0x%08x remote_chk=0x%08x",
-                ev->data.desynced.frame,
-                ev->data.desynced.remote_handle,
-                ev->data.desynced.local_checksum,
-                ev->data.desynced.remote_checksum);
-            CoreAddCallbackMessage(CoreDebugMessageType::Error, buf);
+            case GekkoDesyncDetected:
+                std::snprintf(buf, sizeof(buf),
+                    "[FrameZero] DESYNC frame=%d remote_handle=%d local_chk=0x%08x remote_chk=0x%08x",
+                    ev->data.desynced.frame,
+                    ev->data.desynced.remote_handle,
+                    ev->data.desynced.local_checksum,
+                    ev->data.desynced.remote_checksum);
+                CoreAddCallbackMessage(CoreDebugMessageType::Error, buf);
+                break;
+            case GekkoPlayerSyncing:
+                std::snprintf(buf, sizeof(buf),
+                    "[FrameZero] handshake handle=%d %u/%u",
+                    ev->data.syncing.handle,
+                    (unsigned)ev->data.syncing.current,
+                    (unsigned)ev->data.syncing.max);
+                CoreAddCallbackMessage(CoreDebugMessageType::Info, buf);
+                break;
+            case GekkoPlayerConnected:
+                std::snprintf(buf, sizeof(buf),
+                    "[FrameZero] peer connected: handle=%d",
+                    ev->data.connected.handle);
+                CoreAddCallbackMessage(CoreDebugMessageType::Info, buf);
+                break;
+            case GekkoPlayerDisconnected:
+                std::snprintf(buf, sizeof(buf),
+                    "[FrameZero] peer disconnected: handle=%d",
+                    ev->data.disconnected.handle);
+                CoreAddCallbackMessage(CoreDebugMessageType::Warning, buf);
+                break;
+            case GekkoSessionStarted:
+                CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                    "[FrameZero] session started — all peers ready, gameplay begins.");
+                break;
+            default:
+                break;
         }
     }
 
@@ -356,16 +445,72 @@ static void fz_pump_one_frame(unsigned int current_frame)
                         *ev->data.save.state_len = (unsigned int)written;
                     if (ev->data.save.checksum != nullptr)
                     {
-                        /* FNV-1a over the snapshot bytes — cheap, good
-                         * enough for desync detection. */
-                        uint32_t h = 2166136261u;
+                        /* FNV-1a in 64-bit strides — same family as
+                         * the textbook byte-FNV but ~5-8× faster, which
+                         * matters when hashing happens every frame at
+                         * 60 fps over a 16 MB savestate. The byte-FNV
+                         * version pegged a core for ~16 ms per frame
+                         * and capped emulation throughput well below
+                         * 60 fps, producing audible audio glitching.
+                         * Tail bytes are folded in afterwards so we
+                         * still cover non-multiple-of-8 lengths. */
+                        uint64_t h = 14695981039346656037ULL;
+                        constexpr uint64_t prime = 1099511628211ULL;
                         const uint8_t* p = ev->data.save.state;
-                        for (size_t b = 0; b < written; ++b)
+                        const size_t words = written / 8;
+                        const uint64_t* w = reinterpret_cast<const uint64_t*>(p);
+                        for (size_t b = 0; b < words; ++b)
+                        {
+                            h ^= w[b];
+                            h *= prime;
+                        }
+                        const size_t tail_off = words * 8;
+                        for (size_t b = tail_off; b < written; ++b)
                         {
                             h ^= p[b];
-                            h *= 16777619u;
+                            h *= prime;
                         }
-                        *ev->data.save.checksum = h;
+                        *ev->data.save.checksum =
+                            (uint32_t)(h ^ (h >> 32));
+                    }
+
+                    /* Optional per-chunk checksum dump for cross-instance
+                     * diff. With FRAME_ZERO_SAVE_CHUNK_DEBUG=N, the first
+                     * N save events log a row of 16 chunk hashes so two
+                     * peers' logs can be diffed to localise where the
+                     * snapshots diverge. Each chunk = written/16 bytes. */
+                    static int s_chunk_dbg_remaining = -1;
+                    if (s_chunk_dbg_remaining < 0)
+                    {
+                        const char* e = std::getenv("FRAME_ZERO_SAVE_CHUNK_DEBUG");
+                        s_chunk_dbg_remaining = (e != nullptr && e[0] != '\0' && e[0] != '0')
+                                                ? std::atoi(e) : 0;
+                        if (s_chunk_dbg_remaining < 0) s_chunk_dbg_remaining = 0;
+                    }
+                    if (s_chunk_dbg_remaining > 0)
+                    {
+                        constexpr int kChunks = 16;
+                        const size_t chunk = (written + kChunks - 1) / kChunks;
+                        char line[512];
+                        int off = std::snprintf(line, sizeof(line),
+                            "[FrameZero save-chunks] frame=%d len=%zu :",
+                            ev->data.save.frame, written);
+                        for (int c = 0; c < kChunks && off < (int)sizeof(line) - 16; ++c)
+                        {
+                            size_t s = c * chunk;
+                            size_t e2 = s + chunk;
+                            if (e2 > written) e2 = written;
+                            uint32_t ch = 2166136261u;
+                            for (size_t b = s; b < e2; ++b)
+                            {
+                                ch ^= ev->data.save.state[b];
+                                ch *= 16777619u;
+                            }
+                            off += std::snprintf(line + off, sizeof(line) - off,
+                                                 " %08x", ch);
+                        }
+                        CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(line));
+                        --s_chunk_dbg_remaining;
                     }
                 }
                 break;
@@ -547,6 +692,31 @@ bool CoreHasInitFrameZero(void)
 #endif
 }
 
+bool CoreFrameZeroPreArm(void)
+{
+#ifdef FRAME_ZERO
+    if (!g_init)
+    {
+        if (!CoreInitFrameZero())
+            return false;
+    }
+    if (!fz_resolve_core_hooks())
+    {
+        CoreSetError("CoreFrameZeroPreArm: required core exports missing — rebuild mupen64plus-core");
+        return false;
+    }
+    /* Register the FZ PIF callback now, before any frame runs. The
+     * callback's pre-session branch zeroes every controller channel
+     * so two peers boot with identical PIF state regardless of which
+     * one's input plugin can see the USB adapter. */
+    g_neutralize_inputs.store(true, std::memory_order_release);
+    g_set_pif_sync(fz_pif_sync_callback);
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool CoreStartFrameZeroStressSession(int num_players)
 {
 #ifdef FRAME_ZERO
@@ -657,6 +827,152 @@ bool CoreStartFrameZeroStressSession(int num_players)
 #endif
 }
 
+bool CoreStartFrameZeroOnlineSession(int num_players,
+                                     int local_player_index,
+                                     unsigned short local_port,
+                                     const std::string* remote_addrs,
+                                     int input_delay)
+{
+#ifdef FRAME_ZERO
+    if (!g_init)
+    {
+        CoreSetError("CoreStartFrameZeroOnlineSession: not initialised — call CoreInitFrameZero first");
+        return false;
+    }
+    if (g_session != nullptr)
+    {
+        CoreSetError("CoreStartFrameZeroOnlineSession: a session is already active");
+        return false;
+    }
+    if (num_players < 2 || num_players > 4)
+    {
+        CoreSetError("CoreStartFrameZeroOnlineSession: num_players must be 2..4");
+        return false;
+    }
+    if (local_player_index < 0 || local_player_index >= num_players)
+    {
+        CoreSetError("CoreStartFrameZeroOnlineSession: local_player_index out of range");
+        return false;
+    }
+    if (remote_addrs == nullptr)
+    {
+        CoreSetError("CoreStartFrameZeroOnlineSession: remote_addrs is null");
+        return false;
+    }
+    if (input_delay < 0) input_delay = 0;
+    if (input_delay > 9) input_delay = 9;
+
+    const size_t state_size = FrameZero::stateSnapshotSize();
+    if (state_size == 0)
+    {
+        CoreSetError("CoreStartFrameZeroOnlineSession: snapshot size is 0 — is emulation running?");
+        return false;
+    }
+
+    if (!gekko_create(&g_session, GekkoGameSession))
+    {
+        CoreSetError("CoreStartFrameZeroOnlineSession: gekko_create failed");
+        g_session = nullptr;
+        return false;
+    }
+
+    GekkoConfig config = {};
+    config.num_players              = (unsigned char)num_players;
+    config.max_spectators           = 0;
+    config.input_prediction_window  = 8;     /* SSB64-friendly window */
+    config.spectator_delay          = 0;
+    config.input_size               = 4;
+    config.state_size               = (unsigned int)state_size;
+    config.limited_saving           = false;
+    config.desync_detection         = true;
+    config.check_distance           = 0;     /* Online sessions don't
+                                              * need StressSession's
+                                              * shadow-sim verification. */
+
+    gekko_start(g_session, &config);
+
+    /* Bind UDP socket and attach to session. The default ASIO adapter
+     * is shipped with GekkoNet (NO_ASIO_BUILD must be off — we set it
+     * that way in our top-level CMake). */
+    GekkoNetAdapter* adapter = gekko_default_adapter(local_port);
+    if (adapter == nullptr)
+    {
+        CoreSetError("CoreStartFrameZeroOnlineSession: gekko_default_adapter failed (port in use?)");
+        gekko_destroy(&g_session);
+        g_session = nullptr;
+        return false;
+    }
+    gekko_net_adapter_set(g_session, adapter);
+
+    /* Add actors in slot order. The local slot uses GekkoLocalPlayer
+     * with the configured input delay; remote slots use the address
+     * we were given. GekkoNetAddress.data must point to a "host:port"
+     * string — keep the std::string alive for the duration of the
+     * call by storing each in a stack-local vector. */
+    std::vector<std::string> remote_addr_strings(num_players);
+    for (int i = 0; i < num_players; ++i)
+    {
+        if (i == local_player_index)
+        {
+            gekko_add_actor(g_session, GekkoLocalPlayer, nullptr);
+            gekko_set_local_delay(g_session, i, (unsigned char)input_delay);
+        }
+        else
+        {
+            remote_addr_strings[i] = remote_addrs[i];
+            GekkoNetAddress addr = {};
+            addr.data = (void*)remote_addr_strings[i].c_str();
+            addr.size = (unsigned int)remote_addr_strings[i].size();
+            gekko_add_actor(g_session, GekkoRemotePlayer, &addr);
+        }
+    }
+
+    g_mode = CoreFrameZero::SessionMode::Online;
+    g_num_players = num_players;
+
+    /* Reset shared staging state. */
+    g_local_input_staged.store(0, std::memory_order_relaxed);
+    g_local_input_valid.store(false, std::memory_order_relaxed);
+    for (int i = 0; i < kFZMaxPlayers; ++i) g_synced_inputs[i] = 0;
+    g_synced_count = 0;
+    g_synced_have_data = false;
+    g_pif_synced_this_frame = false;
+    g_pump_call_count = 0;
+    g_pump_debug_resolved = false;
+
+    if (!fz_resolve_core_hooks())
+    {
+        CoreSetError("CoreStartFrameZeroOnlineSession: required core exports missing — rebuild mupen64plus-core");
+        gekko_destroy(&g_session);
+        g_session = nullptr;
+        g_mode = CoreFrameZero::SessionMode::None;
+        return false;
+    }
+    g_set_pif_sync(fz_pif_sync_callback);
+    g_set_pump(nullptr);
+    fz_set_rollback(0);
+    g_attached = true;
+
+    g_clear_shutdown();
+    g_pump_running.store(true, std::memory_order_release);
+    g_pump_thread = std::thread(fz_pump_thread_entry);
+    g_set_pump_driven(1);
+
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+        "[FrameZero] Online session started — local slot %d on UDP port %u, %d players, delay=%d.",
+        local_player_index, (unsigned)local_port, num_players, input_delay);
+    CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
+
+    return true;
+#else
+    (void)num_players; (void)local_player_index; (void)local_port;
+    (void)remote_addrs; (void)input_delay;
+    CoreSetError("CoreStartFrameZeroOnlineSession: build does not include FRAME_ZERO support");
+    return false;
+#endif
+}
+
 bool CoreEndFrameZeroSession(void)
 {
 #ifdef FRAME_ZERO
@@ -688,6 +1004,10 @@ bool CoreEndFrameZeroSession(void)
         fz_set_rollback(0);
         g_attached = false;
     }
+    /* Drop pre-session input neutralization. The next emulation run may
+     * not be a Frame Zero session, and we do not want to keep zeroing
+     * controllers in that case. */
+    g_neutralize_inputs.store(false, std::memory_order_release);
 
     /* 6. Destroy the GekkoNet session. Pump thread is gone, no race. */
     if (g_session != nullptr)

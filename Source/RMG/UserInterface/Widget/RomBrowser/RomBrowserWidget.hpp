@@ -61,6 +61,13 @@ class RomBrowserWidget : public QWidget
 
     QMap<QString, CoreRomSettings> GetModelData(void);
 
+    // Find a ROM file path by matching against the cartridge internal
+    // name (CoreRomHeader.Name). Used by the Frame Zero pre-emulation
+    // connect flow to auto-launch the matched ROM after both peers
+    // handshake. Returns empty string if not found. Substring + case-
+    // insensitive match.
+    QString FindRomByInternalName(QString internalName);
+
   private:
     QStackedWidget* stackedWidget = nullptr;
     Widget::RomBrowserEmptyWidget*    emptyWidget    = nullptr;
