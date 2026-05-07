@@ -115,6 +115,15 @@ EXPORT int  CALL core_wait_for_park(void);
 EXPORT void CALL core_signal_pump_shutdown(void);
 EXPORT void CALL core_clear_pump_shutdown(void);
 
+/* Frame Zero IPC primitives — direct (release-safe) RDRAM access.
+ * `address` is an N64 virtual address; only the low 24 bits index
+ * into RDRAM. Used to read commands written by patched SSB64 code at
+ * a magic RDRAM word and to ack them by clearing.
+ * Unlike DebugMemRead32/Write32, these are not gated on `#ifdef DBG`
+ * and work in release builds. */
+EXPORT uint32_t CALL core_read_rdram_word(uint32_t address);
+EXPORT void     CALL core_write_rdram_word(uint32_t address, uint32_t value);
+
 /* Read by input_plugin_compat.c. */
 extern int g_FrameZero_NeutralizeInput;
 

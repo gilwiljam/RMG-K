@@ -769,6 +769,30 @@ EXPORT void CALL core_clear_pump_shutdown(void)
     SDL_UnlockMutex(l_pump_mutex);
 }
 
+/* Frame Zero IPC primitives. Direct, unconditional access to RDRAM,
+ * unlike DebugMemRead32/Write32 which are gated on #ifdef DBG and
+ * silently no-op in release builds. Used by the Frame Zero in-game
+ * menu integration to read commands written by patched SSB64 code at
+ * a magic RDRAM address each VI, and to clear the word as an "ack."
+ *
+ * address is an N64 virtual address; the low 24 bits index into RDRAM
+ * (after a >>2 to get a word index). Returns 0 / no-op on OOB. */
+EXPORT uint32_t CALL core_read_rdram_word(uint32_t address)
+{
+    if (g_dev.rdram.dram == NULL) return 0;
+    uint32_t word_idx = (address & 0xFFFFFF) >> 2;
+    if (word_idx >= (uint32_t)(g_dev.rdram.dram_size / 4)) return 0;
+    return g_dev.rdram.dram[word_idx];
+}
+
+EXPORT void CALL core_write_rdram_word(uint32_t address, uint32_t value)
+{
+    if (g_dev.rdram.dram == NULL) return;
+    uint32_t word_idx = (address & 0xFFFFFF) >> 2;
+    if (word_idx >= (uint32_t)(g_dev.rdram.dram_size / 4)) return;
+    g_dev.rdram.dram[word_idx] = value;
+}
+
 /* Called from emulation thread inside new_frame(). Park self until
  * the pump thread calls core_resume_emulation_one_frame(), or until
  * pump-driven mode is turned off, or until shutdown is signalled.

@@ -17,6 +17,7 @@
 #include "Netplay.hpp"
 #include "Kaillera.hpp"
 #include "FrameZero.hpp"
+#include "FrameZeroIPC.hpp"
 #include "Plugins.hpp"
 #include "Cheats.hpp"
 #include "Callback.hpp"
@@ -1235,6 +1236,11 @@ static void FrameCallback(unsigned int frameIndex)
 
     // Frame Zero Phase 4 online session (no-op unless FRAME_ZERO_ONLINE=1)
     OnlineTick();
+
+    // Frame Zero in-game IPC poll. No-op unless mupen-core exports are
+    // resolved (CoreFrameZeroIPCInit was called) and the magic word is
+    // non-zero. Cheap when idle: one RDRAM read + branch.
+    CoreFrameZeroIPCPoll();
 }
 
 // Kaillera PIF sync callback (called from mupen64plus-core after netplay sync)
@@ -1697,6 +1703,11 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
 
         // Frame Zero Phase 4 online session (no-op unless FRAME_ZERO_ONLINE=1).
         OnlineArm();
+
+        // Frame Zero in-game IPC channel — resolves the mupen-core
+        // RDRAM read/write exports so FrameCallback's per-VI poll can
+        // observe commands written by patched ROM code. Idempotent.
+        CoreFrameZeroIPCInit();
 
 #ifdef NETPLAY
         // Reset Kaillera sync state to prevent stale cache from previous sessions
