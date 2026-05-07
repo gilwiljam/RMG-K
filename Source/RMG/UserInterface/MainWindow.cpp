@@ -3193,7 +3193,48 @@ void MainWindow::tryFrameZeroConnect(void)
         }
     }
 
-    if (!CoreFrameZeroConnectStart(local_port, peer_addrs, timeout_seconds))
+    /* Resolve the local ROM and its identity tag BEFORE handshake so we
+     * (a) fail fast if the ROM isn't in the local browser, and (b) feed
+     * the identity into the handshake so a peer carrying a different
+     * ROM is rejected immediately. Phase 4 minimum hard-codes SSB64
+     * NTSC-U; Phase 5 will read this from the lobby protocol. */
+    const QString internalName = "SMASH BROTHERS";
+    QString romFile = this->ui_Widget_RomBrowser->FindRomByInternalName(internalName);
+    if (romFile.isEmpty())
+    {
+        this->showErrorMessage("ROM Not Found",
+            "Frame Zero connect requires a ROM with cartridge internal "
+            "name \"" + internalName + "\" in your ROM browser. Add "
+            "SSB64 NTSC-U and refresh the list.");
+        return;
+    }
+
+    /* Cache the resolved ROM file path on the instance for the poll
+     * timer's terminal-state handler — saves looking it up twice. */
+    this->ui_FrameZeroResolvedRomFile = romFile;
+
+    /* Look up the ROM identity. The MD5 alone would suffice but we
+     * include the internal name for diagnostics in mismatch logs. */
+    CoreRomHeader   header   = {};
+    CoreRomSettings settings = {};
+    CoreRomSettings defaultSettings = {};
+    CoreRomType     romType  = CoreRomType::Cartridge;
+    std::string identity;
+    if (CoreGetCachedRomHeaderAndSettings(romFile.toStdU32String(),
+                                          &romType, &header,
+                                          &defaultSettings, &settings))
+    {
+        identity = settings.MD5;  // 32-hex-char N64-MD5
+    }
+    if (identity.empty())
+    {
+        this->showErrorMessage("ROM Not Found",
+            "Could not read the cached MD5 for \"" + romFile + "\". "
+            "Refresh the ROM browser and try again.");
+        return;
+    }
+
+    if (!CoreFrameZeroConnectStart(local_port, peer_addrs, timeout_seconds, identity))
     {
         this->showErrorMessage("Frame Zero connect failed",
             "Could not start the pre-emulation handshake. "
@@ -3201,9 +3242,9 @@ void MainWindow::tryFrameZeroConnect(void)
         return;
     }
 
-    /* Poll status from the UI thread; on Connected we look up the ROM
-     * and launch emulation. 250 ms cadence is plenty — the worker
-     * thread does the actual handshake at 100 ms granularity. */
+    /* Poll status from the UI thread; on Connected we launch emulation
+     * with the already-resolved ROM. 250 ms cadence is plenty — the
+     * worker thread does the actual handshake at 100 ms granularity. */
     if (this->ui_FrameZeroPollTimer == nullptr)
     {
         this->ui_FrameZeroPollTimer = new QTimer(this);
@@ -3238,19 +3279,13 @@ void MainWindow::pollFrameZeroConnectStatus(void)
             return;
         }
 
-        /* Find the matching ROM by cartridge internal name. SSB64
-         * NTSC-U's internal name is "SMASH BROTHERS" — Phase 4
-         * minimum hard-codes that target. Eventually this'll come
-         * from a session config message rather than a constant. */
-        const QString internalName = "SMASH BROTHERS";
-        QString romFile = this->ui_Widget_RomBrowser->FindRomByInternalName(internalName);
+        /* ROM was already resolved + identity-checked in
+         * tryFrameZeroConnect; just use the cached path. */
+        QString romFile = this->ui_FrameZeroResolvedRomFile;
         if (romFile.isEmpty())
         {
-            this->showErrorMessage("ROM Not Found",
-                "Frame Zero connect succeeded but no ROM matching "
-                "internal name \"" + internalName + "\" was found in your "
-                "ROM browser. Add SSB64 NTSC-U and refresh the list.");
-            CoreFrameZeroConnectStop();
+            this->showErrorMessage("Frame Zero internal error",
+                "Resolved ROM path missing — please retry.");
             return;
         }
 
@@ -3282,6 +3317,16 @@ void MainWindow::pollFrameZeroConnectStatus(void)
         this->showErrorMessage("Frame Zero connect error",
             "UDP socket bind or I/O failure. "
             "Check FRAME_ZERO_ONLINE_PORT for conflicts.");
+    }
+    else if (status == S::RomMismatch)
+    {
+        const std::string remote_id = CoreFrameZeroConnectGetRemoteIdentity();
+        QString remote_q = QString::fromStdString(remote_id);
+        if (remote_q.isEmpty()) remote_q = "(unknown)";
+        this->showErrorMessage("ROM mismatch",
+            "Your peer is loading a different ROM. Both peers must "
+            "load the same ROM file (matching MD5) for rollback "
+            "netplay to work.\n\nRemote MD5: " + remote_q);
     }
 }
 

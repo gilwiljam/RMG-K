@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -38,12 +39,15 @@ typedef int fz_socket_t;
 namespace
 {
 
-constexpr const char* kHello = "FZ_HELLO\n";
-constexpr const char* kAck   = "FZ_ACK\n";
+constexpr const char* kHelloPrefix = "FZ_HELLO ";
+constexpr const char* kAck         = "FZ_ACK\n";
+constexpr size_t      kMaxIdentity = 64;
 
 std::atomic<CoreFrameZero::ConnectStatus> g_status{CoreFrameZero::ConnectStatus::Idle};
 std::atomic<bool>                          g_should_stop{false};
 std::thread                                g_worker;
+std::mutex                                 g_remote_identity_mu;
+std::string                                g_remote_identity;
 
 struct ParsedAddr
 {
@@ -118,7 +122,8 @@ static void set_nonblocking(fz_socket_t s)
 
 static void worker(unsigned short local_port,
                    std::vector<ParsedAddr> peers,
-                   int timeout_seconds)
+                   int timeout_seconds,
+                   std::string local_identity)
 {
     using clock = std::chrono::steady_clock;
 
@@ -156,11 +161,19 @@ static void worker(unsigned short local_port,
     }
     set_nonblocking(sock);
 
-    char log[192];
+    char log[256];
     std::snprintf(log, sizeof(log),
-        "[FrameZero connect] listening on UDP %u, expecting %zu peer(s)",
-        (unsigned)local_port, peers.size());
+        "[FrameZero connect] listening on UDP %u, expecting %zu peer(s), identity='%s'",
+        (unsigned)local_port, peers.size(),
+        local_identity.empty() ? "(none)" : local_identity.c_str());
     CoreAddCallbackMessage(CoreDebugMessageType::Info, log);
+
+    /* Pre-format the HELLO once. */
+    std::string hello_msg;
+    hello_msg.reserve(std::strlen(kHelloPrefix) + local_identity.size() + 1);
+    hello_msg.append(kHelloPrefix);
+    hello_msg.append(local_identity);
+    hello_msg.push_back('\n');
 
     /* Track per-peer handshake progress. Peers identified by their
      * canonical "ip:port" string. */
@@ -188,7 +201,7 @@ static void worker(unsigned short local_port,
         {
             for (const auto& p : peers)
             {
-                sendto(sock, kHello, (int)std::strlen(kHello), 0,
+                sendto(sock, hello_msg.c_str(), (int)hello_msg.size(), 0,
                        (const sockaddr*)&p.sa, sizeof(p.sa));
                 /* Keep ACKing peers we've heard from until they've
                  * acked us back — repetition makes the handshake
@@ -225,8 +238,40 @@ static void worker(unsigned short local_port,
             }
             if (known)
             {
-                if (std::strncmp(buf, kHello, std::strlen(kHello)) == 0)
+                const size_t prefix_len = std::strlen(kHelloPrefix);
+                if (std::strncmp(buf, kHelloPrefix, prefix_len) == 0)
                 {
+                    /* Extract identity: everything between prefix and \n
+                     * (or end of buffer). Cap at kMaxIdentity so a
+                     * malformed packet can't blow our string out. */
+                    const char* id_start = buf + prefix_len;
+                    const char* id_end = id_start;
+                    while (*id_end != '\0' && *id_end != '\n' &&
+                           (size_t)(id_end - id_start) < kMaxIdentity)
+                    {
+                        ++id_end;
+                    }
+                    std::string remote_id(id_start, id_end - id_start);
+
+                    {
+                        std::lock_guard<std::mutex> lk(g_remote_identity_mu);
+                        if (g_remote_identity.empty())
+                            g_remote_identity = remote_id;
+                    }
+
+                    if (remote_id != local_identity)
+                    {
+                        char err[320];
+                        std::snprintf(err, sizeof(err),
+                            "[FrameZero connect] ROM mismatch — local='%s' remote='%s' from %s. Both peers must load the same ROM.",
+                            local_identity.empty() ? "(none)" : local_identity.c_str(),
+                            remote_id.empty()      ? "(none)" : remote_id.c_str(),
+                            from_canon.c_str());
+                        CoreAddCallbackMessage(CoreDebugMessageType::Error, err);
+                        FZ_CLOSE_SOCKET(sock);
+                        g_status.store(CoreFrameZero::ConnectStatus::RomMismatch);
+                        return;
+                    }
                     hello_received.insert(from_canon);
                 }
                 else if (std::strncmp(buf, kAck, std::strlen(kAck)) == 0)
@@ -285,7 +330,8 @@ static void worker(unsigned short local_port,
 
 bool CoreFrameZeroConnectStart(unsigned short local_port,
                                 const std::vector<std::string>& peer_addrs,
-                                int timeout_seconds)
+                                int timeout_seconds,
+                                const std::string& local_identity)
 {
     if (g_status.load() == CoreFrameZero::ConnectStatus::Connecting)
     {
@@ -314,10 +360,30 @@ bool CoreFrameZeroConnectStart(unsigned short local_port,
         return false;
     }
 
+    /* Cap identity length defensively — protocol caps remote-side
+     * parsing at kMaxIdentity, so anything longer locally would just
+     * trigger spurious mismatches. */
+    std::string id = local_identity;
+    if (id.size() > kMaxIdentity) id.resize(kMaxIdentity);
+    /* Strip newlines/spaces — those are framing. */
+    for (char& c : id) { if (c == '\n' || c == '\r' || c == ' ') c = '_'; }
+
+    {
+        std::lock_guard<std::mutex> lk(g_remote_identity_mu);
+        g_remote_identity.clear();
+    }
+
     g_should_stop.store(false);
     g_status.store(CoreFrameZero::ConnectStatus::Connecting);
-    g_worker = std::thread(worker, local_port, std::move(parsed), timeout_seconds);
+    g_worker = std::thread(worker, local_port, std::move(parsed),
+                           timeout_seconds, std::move(id));
     return true;
+}
+
+std::string CoreFrameZeroConnectGetRemoteIdentity(void)
+{
+    std::lock_guard<std::mutex> lk(g_remote_identity_mu);
+    return g_remote_identity;
 }
 
 CoreFrameZero::ConnectStatus CoreFrameZeroConnectGetStatus(void)

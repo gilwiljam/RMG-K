@@ -153,6 +153,11 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
      * schedules the connect attempt after a delay. */
     bool ui_FrameZeroConnectPending = false;
     QTimer* ui_FrameZeroPollTimer  = nullptr;
+    /* Resolved ROM file path, cached between tryFrameZeroConnect (which
+     * looks the ROM up + reads its MD5 for the handshake identity tag)
+     * and pollFrameZeroConnectStatus (which launches emulation when
+     * the handshake reaches Connected). */
+    QString ui_FrameZeroResolvedRomFile;
 
     void closeEvent(QCloseEvent *) Q_DECL_OVERRIDE;
 
