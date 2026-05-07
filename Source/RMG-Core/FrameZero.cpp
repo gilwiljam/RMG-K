@@ -68,6 +68,29 @@ GekkoSession*                   g_session = nullptr;
 CoreFrameZero::SessionMode      g_mode    = CoreFrameZero::SessionMode::None;
 bool                            g_init    = false;
 int                             g_num_players = 0;
+int                             g_local_slot  = 0;
+
+/* Confirmed-frame tracker for predicted-advance detection. GekkoNet
+ * doesn't expose "is this advance predicted vs confirmed" directly,
+ * so we infer: a rolling_back=true Advance or a LoadEvent both signal
+ * that the named frame's inputs are now confirmed. Any rolling_back=
+ * false Advance whose frame number exceeds this watermark is therefore
+ * being run with predicted input. Used to drive the button-release
+ * prediction override below. */
+int                             g_confirmed_frame = -1;
+
+/* Button-release prediction override toggle. Default ON for online
+ * sessions: GekkoNet predicts "copy last input" which means a held
+ * button stays held during prediction; mispredictions on the actual
+ * release frame produce one frame of phantom-held button state that
+ * gets resolved by rollback but can produce visible/audible glitches
+ * (charge-attack flicker, audio cue, etc.) before rollback runs. With
+ * the override on, we mask buttons on remote slots during predicted
+ * advances so the prediction is "released" — the worst case becomes
+ * "predicted release, actually held" which for fighting games is
+ * less disruptive (a brief input gap instead of a phantom action).
+ * Stick bytes are kept as-is because they change continuously. */
+bool                            g_predict_release_buttons = false;
 
 /* Local-input staging: PIF callback writes here on each first
  * JCMD_CONTROLLER_READ of a frame; pump reads it and feeds GekkoNet. */
@@ -523,6 +546,12 @@ static void fz_pump_one_frame(unsigned int current_frame)
                     break;
                 FrameZero::restoreFromBuffer(ev->data.load.state,
                                              ev->data.load.state_len);
+                /* Loading back to a frame implicitly confirms it: the
+                 * AdvanceEvents that follow will re-simulate with newly
+                 * received real input. Bump the watermark so we don't
+                 * mis-classify those re-advances as predicted. */
+                if (ev->data.load.frame > g_confirmed_frame)
+                    g_confirmed_frame = ev->data.load.frame;
                 saw_load = true;
                 break;
             }
@@ -532,6 +561,23 @@ static void fz_pump_one_frame(unsigned int current_frame)
                 last_adv_frame = ev->data.adv.frame;
                 ++n_advance;
                 if (ev->data.adv.rolling_back) ++n_advance_rb;
+
+                /* A rolling_back advance carries newly-confirmed input
+                 * for its frame. Bump the confirmed-frame watermark. */
+                if (ev->data.adv.rolling_back &&
+                    ev->data.adv.frame > g_confirmed_frame)
+                {
+                    g_confirmed_frame = ev->data.adv.frame;
+                }
+
+                /* This advance is predicted iff GekkoNet is running it
+                 * forward past the confirmed-frame watermark with
+                 * GekkoNet's default "copy previous input" prediction.
+                 * Local slot is excluded — local input is always real
+                 * (we just polled and pushed it via gekko_add_local_input). */
+                const bool is_predicted = !ev->data.adv.rolling_back &&
+                                          ev->data.adv.frame > g_confirmed_frame;
+
                 /* The advance payload concatenates per-player inputs:
                  * input_size * num_players bytes. We assume input_size
                  * matches our 4-byte controller word. */
@@ -547,6 +593,23 @@ static void fz_pump_one_frame(unsigned int current_frame)
                                      ((uint32_t)src[1] <<  8) |
                                      ((uint32_t)src[2] << 16) |
                                      ((uint32_t)src[3] << 24);
+
+                        /* Button-release prediction override: when this
+                         * advance is predicted and the slot is remote,
+                         * mask the button bytes (high half of v) but
+                         * keep the stick bytes (low half, X/Y axes).
+                         * See g_predict_release_buttons docs. Both
+                         * peers apply the same mask deterministically,
+                         * so checksums still match; the subsequent
+                         * rolling_back=true re-advance uses the real
+                         * input without masking. */
+                        if (is_predicted &&
+                            g_predict_release_buttons &&
+                            p != g_local_slot)
+                        {
+                            v &= 0x0000FFFFu;
+                        }
+
                         g_synced_inputs[p] = v;
                     }
                     g_synced_count = n;
@@ -591,14 +654,14 @@ static void fz_pump_one_frame(unsigned int current_frame)
 
     if (log_this_call)
     {
-        char buf[256];
+        char buf[320];
         std::snprintf(buf, sizeof(buf),
             "[FrameZero pump] call=%d  events=%d  S=%d L=%d A=%d (rb=%d)  "
-            "save_f=%d load_f=%d adv_f=[%d..%d]",
+            "save_f=%d load_f=%d adv_f=[%d..%d] confirmed_f=%d",
             g_pump_call_count,
             count, n_save, n_load, n_advance, n_advance_rb,
             first_save_frame, first_load_frame,
-            first_adv_frame, last_adv_frame);
+            first_adv_frame, last_adv_frame, g_confirmed_frame);
         CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
     }
     (void)current_frame;
@@ -777,6 +840,12 @@ bool CoreStartFrameZeroStressSession(int num_players)
 
     g_mode = CoreFrameZero::SessionMode::StressTest;
     g_num_players = num_players;
+    g_local_slot = 0;
+    g_confirmed_frame = -1;
+    /* Stress mode is single-instance; the prediction-override is an
+     * online-correctness feature and would just add a per-frame
+     * branch here for no benefit. Leave it off. */
+    g_predict_release_buttons = false;
 
     /* Reset shared staging state so a previous session's data can't
      * leak into the new one. */
@@ -929,6 +998,16 @@ bool CoreStartFrameZeroOnlineSession(int num_players,
 
     g_mode = CoreFrameZero::SessionMode::Online;
     g_num_players = num_players;
+    g_local_slot = local_player_index;
+    g_confirmed_frame = -1;
+    /* Default the button-release prediction override on for online
+     * sessions; FRAME_ZERO_PREDICT_RELEASE_BUTTONS=0 disables it for
+     * A/B testing. See g_predict_release_buttons docs above. */
+    {
+        const char* env = std::getenv("FRAME_ZERO_PREDICT_RELEASE_BUTTONS");
+        g_predict_release_buttons =
+            (env == nullptr) || !(env[0] == '0' && env[1] == '\0');
+    }
 
     /* Reset shared staging state. */
     g_local_input_staged.store(0, std::memory_order_relaxed);
@@ -958,10 +1037,11 @@ bool CoreStartFrameZeroOnlineSession(int num_players,
     g_pump_thread = std::thread(fz_pump_thread_entry);
     g_set_pump_driven(1);
 
-    char buf[160];
+    char buf[200];
     std::snprintf(buf, sizeof(buf),
-        "[FrameZero] Online session started — local slot %d on UDP port %u, %d players, delay=%d.",
-        local_player_index, (unsigned)local_port, num_players, input_delay);
+        "[FrameZero] Online session started — local slot %d on UDP port %u, %d players, delay=%d, predict-release=%s.",
+        local_player_index, (unsigned)local_port, num_players, input_delay,
+        g_predict_release_buttons ? "on" : "off");
     CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
 
     return true;
@@ -1017,6 +1097,9 @@ bool CoreEndFrameZeroSession(void)
     }
     g_mode = CoreFrameZero::SessionMode::None;
     g_num_players = 0;
+    g_local_slot = 0;
+    g_confirmed_frame = -1;
+    g_predict_release_buttons = false;
     g_synced_have_data = false;
     g_synced_count = 0;
     g_local_input_valid.store(false, std::memory_order_relaxed);
