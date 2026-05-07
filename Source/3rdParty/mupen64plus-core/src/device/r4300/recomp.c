@@ -1006,7 +1006,7 @@ static void *malloc_exec(size_t size)
 
     void *block = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (block == MAP_FAILED)
-    { DebugMessage(M64MSG_ERROR, "Memory error: couldn't allocate %zi byte block of aligned RWX memory.", size); return NULL; }
+    { DebugMessage(M64MSG_ERROR, "Memory error: couldn't allocate %lld byte block of aligned RWX memory.", (long long)size); return NULL; }
 
     return block;
 #else

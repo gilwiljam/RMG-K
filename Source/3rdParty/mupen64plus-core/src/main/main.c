@@ -138,6 +138,57 @@ m64p_media_loader g_media_loader;
 
 int g_gs_vi_counter = 0;
 
+/* Frame Zero: per-frame pump, fired from new_frame() on the emulation
+ * thread. NULL when no Frame Zero session is active. */
+static m64p_frame_zero_pump l_FrameZeroPump = NULL;
+
+/* Frame Zero Phase 3.5 — pump-driven park sync.
+ * See main.h for the lifecycle contract. The mutex+cond pair guards
+ * l_pump_park_state; the two atomic flags are read on the hot path
+ * outside the mutex to avoid taking it when we're not pump-driven.
+ * SDL3 renamed the opaque types from SDL_mutex/SDL_cond to
+ * SDL_Mutex/SDL_Condition, so we follow workqueue.c's macro split. */
+#ifdef USE_SDL3
+static SDL_Mutex*     l_pump_mutex = NULL;
+static SDL_Condition* l_pump_cv    = NULL;
+#else
+static SDL_mutex*     l_pump_mutex = NULL;
+static SDL_cond*      l_pump_cv    = NULL;
+#endif
+static volatile int l_pump_park_state = 0;  /* 0=running, 1=parked */
+static volatile int l_pump_driven     = 0;
+static volatile int l_pump_shutdown   = 0;
+
+static void core_pump_sync_init(void)
+{
+    if (l_pump_mutex == NULL)
+        l_pump_mutex = SDL_CreateMutex();
+    if (l_pump_cv == NULL)
+#ifdef USE_SDL3
+        l_pump_cv = SDL_CreateCondition();
+#else
+        l_pump_cv = SDL_CreateCond();
+#endif
+}
+
+static void core_pump_cv_wait(void)
+{
+#ifdef USE_SDL3
+    SDL_WaitCondition(l_pump_cv, l_pump_mutex);
+#else
+    SDL_CondWait(l_pump_cv, l_pump_mutex);
+#endif
+}
+
+static void core_pump_cv_broadcast(void)
+{
+#ifdef USE_SDL3
+    SDL_BroadcastCondition(l_pump_cv);
+#else
+    SDL_CondBroadcast(l_pump_cv);
+#endif
+}
+
 /** static (local) variables **/
 static int   l_CurrentFrame = 0;         // frame counter
 static int   l_TakeScreenshot = 0;       // Tell OSD Rendering callback to take a screenshot just before drawing the OSD
@@ -663,6 +714,83 @@ EXPORT int CALL core_get_input_neutralize(void)
     return g_FrameZero_NeutralizeInput;
 }
 
+EXPORT void CALL core_set_frame_zero_pump(m64p_frame_zero_pump cb)
+{
+    l_FrameZeroPump = cb;
+}
+
+EXPORT void CALL core_set_pump_driven(int v)
+{
+    core_pump_sync_init();
+    l_pump_driven = v ? 1 : 0;
+    /* Toggle wakes both sides — emulation may be parked, pump may be
+     * waiting. The flag check inside the loop will let them re-evaluate. */
+    SDL_LockMutex(l_pump_mutex);
+    core_pump_cv_broadcast();
+    SDL_UnlockMutex(l_pump_mutex);
+}
+
+EXPORT void CALL core_resume_emulation_one_frame(void)
+{
+    if (l_pump_mutex == NULL) return;
+    SDL_LockMutex(l_pump_mutex);
+    l_pump_park_state = 0;
+    core_pump_cv_broadcast();
+    SDL_UnlockMutex(l_pump_mutex);
+}
+
+EXPORT int CALL core_wait_for_park(void)
+{
+    if (l_pump_mutex == NULL) return 0;
+    SDL_LockMutex(l_pump_mutex);
+    while (l_pump_park_state == 0 && !l_pump_shutdown)
+    {
+        core_pump_cv_wait();
+    }
+    int parked = (l_pump_park_state == 1) && !l_pump_shutdown;
+    SDL_UnlockMutex(l_pump_mutex);
+    return parked;
+}
+
+EXPORT void CALL core_signal_pump_shutdown(void)
+{
+    if (l_pump_mutex == NULL) return;
+    SDL_LockMutex(l_pump_mutex);
+    l_pump_shutdown = 1;
+    core_pump_cv_broadcast();
+    SDL_UnlockMutex(l_pump_mutex);
+}
+
+EXPORT void CALL core_clear_pump_shutdown(void)
+{
+    if (l_pump_mutex == NULL) return;
+    SDL_LockMutex(l_pump_mutex);
+    l_pump_shutdown = 0;
+    SDL_UnlockMutex(l_pump_mutex);
+}
+
+/* Called from emulation thread inside new_frame(). Park self until
+ * the pump thread calls core_resume_emulation_one_frame(), or until
+ * pump-driven mode is turned off, or until shutdown is signalled.
+ * No-op when not pump-driven, so the call site is always safe. */
+static void core_park_emulation_at_frame_boundary(void)
+{
+    if (!l_pump_driven || l_pump_mutex == NULL) return;
+
+    SDL_LockMutex(l_pump_mutex);
+    l_pump_park_state = 1;
+    core_pump_cv_broadcast();
+    while (l_pump_park_state == 1 && l_pump_driven && !l_pump_shutdown)
+    {
+        core_pump_cv_wait();
+    }
+    /* Force-clear state on the way out — handles the case where the
+     * pump thread set state=0 already, AND the case where shutdown
+     * forced us out without the pump touching it. */
+    l_pump_park_state = 0;
+    SDL_UnlockMutex(l_pump_mutex);
+}
+
 static void main_draw_volume_osd(void)
 {
     char msgString[64];
@@ -1005,6 +1133,11 @@ void new_frame(void)
     if (g_FrameCallback != NULL)
         (*g_FrameCallback)(l_CurrentFrame);
 
+    /* Frame Zero (legacy single-thread pump). NULL when not in use —
+     * superseded by pump-driven mode below. */
+    if (l_FrameZeroPump != NULL)
+        (*l_FrameZeroPump)((unsigned int)l_CurrentFrame);
+
     /* advance the current frame */
     l_CurrentFrame++;
 
@@ -1014,6 +1147,12 @@ void new_frame(void)
         g_RollbackMode = 0; /* Frame Zero: clear rollback flag after silent advance */
         StateChanged(M64CORE_EMU_STATE, M64EMU_PAUSED);
     }
+
+    /* Frame Zero Phase 3.5 — park the emulation thread at the frame
+     * boundary when pump-driven mode is on. The pump thread releases
+     * us per-frame via core_resume_emulation_one_frame(). No-op when
+     * pump-driven mode is off, so non-FZ paths pay nothing. */
+    core_park_emulation_at_frame_boundary();
 }
 
 static void apply_speed_limiter(void)
@@ -1023,7 +1162,19 @@ static void apply_speed_limiter(void)
     static int lastSpeedFactor = 100;
     static uint64_t StartFPSTime = 0;
     static const double defaultSpeedFactor = 100.0;
-    uint64_t CurrentFPSTime = SDL_GetTicks();
+    uint64_t CurrentFPSTime;
+
+    /* Frame Zero: rollback re-simulation must run at native CPU speed,
+     * not 60 Hz wall clock. Force the limiter's clock to re-baseline
+     * on the next normal frame so it doesn't try to "make up" all the
+     * fast frames spent in rollback. */
+    if (g_RollbackMode)
+    {
+        resetOnce = 0;
+        return;
+    }
+
+    CurrentFPSTime = SDL_GetTicks();
 
     // calculate frame duration based upon ROM setting (50/60hz) and mupen64plus speed adjustment
     const double VILimitMilliseconds = 1000.0 / g_dev.vi.expected_refresh_rate;
@@ -1437,9 +1588,9 @@ static int load_dd_disk(struct dd_disk* dd_disk, const struct storage_backend_in
     /* Generate LBA conversion table */
     GenerateLBAToPhysTable(dd_disk);
 
-    DebugMessage(M64MSG_INFO, "DD Disk: %s - %zu - %s",
+    DebugMessage(M64MSG_INFO, "DD Disk: %s - %llu - %s",
             dd_disk_filename,
-            (*dd_idisk)->size(dd_disk),
+            (unsigned long long)(*dd_idisk)->size(dd_disk),
             get_disk_format_name(format));
 
     /* Get region from disk and byteswap it as needed */
@@ -1524,9 +1675,9 @@ static void init_gb_rom(void* opaque, void** storage, const struct storage_backe
         goto no_cart;
     }
 
-    DebugMessage(M64MSG_INFO, "GB Loader ROM: %s - %zu",
+    DebugMessage(M64MSG_INFO, "GB Loader ROM: %s - %llu",
             data->rom_fstorage.filename,
-            data->rom_fstorage.size);
+            (unsigned long long)data->rom_fstorage.size);
 
     /* init GB ROM storage */
     *storage = &data->rom_fstorage;
@@ -1576,9 +1727,9 @@ static void init_gb_ram(void* opaque, size_t ram_size, void** storage, const str
         DebugMessage(M64MSG_WARNING, "Size mismatch between expected RAM size and effective file size");
     }
 
-    DebugMessage(M64MSG_INFO, "GB Loader RAM: %s - %zu",
+    DebugMessage(M64MSG_INFO, "GB Loader RAM: %s - %llu",
             data->ram_fstorage.filename,
-            data->ram_fstorage.size);
+            (unsigned long long)data->ram_fstorage.size);
 
     /* init GB RAM storage */
     *storage = &data->ram_fstorage;

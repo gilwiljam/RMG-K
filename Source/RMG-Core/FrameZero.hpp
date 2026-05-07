@@ -70,23 +70,10 @@ CORE_EXPORT bool CoreEndFrameZeroSession(void);
 // Returns the current session mode. None if no session is active.
 CORE_EXPORT CoreFrameZero::SessionMode CoreGetFrameZeroSessionMode(void);
 
-// Per-frame pump — called from the emulation thread. Feeds the local
-// input into GekkoNet, processes any save/load/advance events queued by
-// the SDK, and writes the synchronised inputs back into `values`.
-//
-// values: pointer to a `num_players * size`-byte buffer. On entry the
-//   first `size` bytes are the local player's input; on return all
-//   slots are filled with the synchronised inputs from GekkoNet.
-// size: bytes per input (4 for an N64 controller word).
-// num_players: how many input slots in `values`.
-//
-// Returns the number of bytes written, or -1 on error.
-//
-// NOTE: the per-frame loop is unimplemented in the Phase 3 skeleton
-// because GekkoNet's GekkoAdvanceEvent expects a synchronous frame
-// advance call, and `advance_one_frame_silent()` in mupen64plus-core
-// is currently non-blocking. Adding a synchronous variant is a
-// prerequisite for this function to do real work.
+// Obsolete — kept for ABI compatibility with the Phase 3 skeleton. Always
+// returns -1 in the active architecture; per-frame work happens via the
+// PIF sync callback and the new_frame() pump hook registered when a
+// Frame Zero session starts.
 CORE_EXPORT int CoreFrameZeroModifyPlayValues(void* values, int size, int num_players);
 
 #endif // CORE_FRAMEZERO_HPP

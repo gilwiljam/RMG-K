@@ -164,4 +164,39 @@ bool restoreState(int slot)
                                   s_state.slots[slot].size) != 0;
 }
 
+bool captureToBuffer(uint8_t* dst, size_t dst_len, size_t* out_len)
+{
+    if (!s_state.ready || dst == nullptr)
+        return false;
+
+    /* savestates_save_to_buffer always allocates a fresh buffer. We copy
+     * into the caller's buffer and free. One extra ~16 MB memcpy per
+     * SaveEvent — acceptable for Phase 3; revisit if it shows up in
+     * profiling. */
+    uint8_t* tmp = nullptr;
+    size_t   tmp_len = 0;
+    if (!s_state.saveToBuffer(&tmp, &tmp_len) || tmp == nullptr)
+        return false;
+
+    if (tmp_len > dst_len)
+    {
+        std::free(tmp);
+        return false;
+    }
+
+    std::memcpy(dst, tmp, tmp_len);
+    std::free(tmp);
+
+    if (out_len != nullptr)
+        *out_len = tmp_len;
+    return true;
+}
+
+bool restoreFromBuffer(const uint8_t* src, size_t len)
+{
+    if (!s_state.ready || src == nullptr || len == 0)
+        return false;
+    return s_state.loadFromBuffer(src, len) != 0;
+}
+
 } // namespace FrameZero

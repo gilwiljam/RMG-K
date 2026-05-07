@@ -540,7 +540,8 @@ uint8_t* scan_and_expand_disk_format(uint8_t* data, size_t size,
         else if (size != d64_size)
         {
             isValidDisk = -1;
-            DebugMessage(M64MSG_ERROR, "Invalid D64 Disk size %zu (calculated 0x200 + 0x%zx + 0x%zx = %zu).", size, rom_size, ram_size, d64_size);
+            DebugMessage(M64MSG_ERROR, "Invalid D64 Disk size %llu (calculated 0x200 + 0x%llx + 0x%llx = %llu).",
+                (unsigned long long)size, (unsigned long long)rom_size, (unsigned long long)ram_size, (unsigned long long)d64_size);
         }
         else
         {
@@ -599,7 +600,7 @@ uint8_t* scan_and_expand_disk_format(uint8_t* data, size_t size,
     default:
         if (isValidDisk == -1)
         {
-            DebugMessage(M64MSG_ERROR, "Invalid DD Disk size %zu.", size);
+            DebugMessage(M64MSG_ERROR, "Invalid DD Disk size %llu.", (unsigned long long)size);
             return NULL;
         }
         else

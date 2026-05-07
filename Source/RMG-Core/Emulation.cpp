@@ -16,6 +16,7 @@
 #include "Library.hpp"
 #include "Netplay.hpp"
 #include "Kaillera.hpp"
+#include "FrameZero.hpp"
 #include "Plugins.hpp"
 #include "Cheats.hpp"
 #include "Callback.hpp"
@@ -822,6 +823,154 @@ static void RoundtripTick()
 
 } // namespace
 
+namespace {
+
+//
+// Phase 3 stress-test harness — local sync test for the GekkoNet
+// integration. Activated by FRAME_ZERO_STRESS=<frames> (or =1 to use
+// the default 10000). After the standard settle period we open a
+// StressTest session for the configured player count and let it run
+// for `frames` frames. Any DESYNC events are logged via the existing
+// pump path. At target the session is torn down and a one-shot
+// summary line is logged.
+//
+// Use FRAME_ZERO_STRESS_PLAYERS to override player count (default 2).
+// Use FRAME_ZERO_STRESS_SETTLE to override the pre-arm settle window
+// (default 600 frames, same as the spike).
+//
+
+enum class StressPhase
+{
+    Disabled,
+    Settle,
+    Running,
+    Done,
+};
+
+constexpr int kStressSettleFramesDefault = 600;
+constexpr int kStressFramesDefault       = 10000;
+constexpr int kStressPlayersDefault      = 2;
+
+struct StressState
+{
+    StressPhase phase    = StressPhase::Disabled;
+    int settleFrames     = kStressSettleFramesDefault;
+    int targetFrames     = kStressFramesDefault;
+    int players          = kStressPlayersDefault;
+    int frameInPhase     = 0;
+};
+
+static StressState s_Stress;
+
+static int parse_env_int(const char* name, int default_v, int min_v)
+{
+    const char* env = std::getenv(name);
+    if (env == nullptr || env[0] == '\0')
+        return default_v;
+    int v = std::atoi(env);
+    if (v < min_v)
+        return default_v;
+    return v;
+}
+
+static void StressArm()
+{
+    const char* env = std::getenv("FRAME_ZERO_STRESS");
+    if (env == nullptr || env[0] == '\0' || env[0] == '0')
+    {
+        s_Stress.phase = StressPhase::Disabled;
+        return;
+    }
+
+#ifndef FRAME_ZERO
+    CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+        "[FrameZero stress] FRAME_ZERO_STRESS=1 but build does not include FRAME_ZERO support. Test disabled.");
+    s_Stress.phase = StressPhase::Disabled;
+    return;
+#else
+    s_Stress.targetFrames = std::atoi(env);
+    if (s_Stress.targetFrames < 60)
+        s_Stress.targetFrames = kStressFramesDefault;
+
+    s_Stress.settleFrames = parse_env_int("FRAME_ZERO_STRESS_SETTLE",
+                                          kStressSettleFramesDefault, 60);
+    s_Stress.players      = parse_env_int("FRAME_ZERO_STRESS_PLAYERS",
+                                          kStressPlayersDefault, 1);
+    if (s_Stress.players > 4) s_Stress.players = 4;
+
+    s_Stress.phase        = StressPhase::Settle;
+    s_Stress.frameInPhase = 0;
+
+    char buf[192];
+    std::snprintf(buf, sizeof(buf),
+        "[FrameZero stress] Armed. settle=%d frames, run=%d frames, players=%d.",
+        s_Stress.settleFrames, s_Stress.targetFrames, s_Stress.players);
+    CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
+#endif
+}
+
+static void StressTick()
+{
+#ifndef FRAME_ZERO
+    return;
+#else
+    if (s_Stress.phase == StressPhase::Disabled || s_Stress.phase == StressPhase::Done)
+        return;
+
+    switch (s_Stress.phase)
+    {
+        case StressPhase::Settle:
+        {
+            ++s_Stress.frameInPhase;
+            if (s_Stress.frameInPhase >= s_Stress.settleFrames)
+            {
+                if (!CoreInitFrameZero())
+                {
+                    CoreAddCallbackMessage(CoreDebugMessageType::Error,
+                        "[FrameZero stress] CoreInitFrameZero failed — disabling test.");
+                    s_Stress.phase = StressPhase::Done;
+                    break;
+                }
+                /* Clean up any session leaked from a previous emulation
+                 * run (CoreEndFrameZeroSession is idempotent). */
+                CoreEndFrameZeroSession();
+                if (!CoreStartFrameZeroStressSession(s_Stress.players))
+                {
+                    CoreAddCallbackMessage(CoreDebugMessageType::Error,
+                        "[FrameZero stress] CoreStartFrameZeroStressSession failed — disabling test.");
+                    s_Stress.phase = StressPhase::Done;
+                    break;
+                }
+                s_Stress.phase = StressPhase::Running;
+                s_Stress.frameInPhase = 0;
+                CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                    "[FrameZero stress] Session started. Running…");
+            }
+            break;
+        }
+        case StressPhase::Running:
+        {
+            ++s_Stress.frameInPhase;
+            if (s_Stress.frameInPhase >= s_Stress.targetFrames)
+            {
+                CoreEndFrameZeroSession();
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                    "[FrameZero stress] Done after %d frames. Inspect log for any DESYNC lines.",
+                    s_Stress.targetFrames);
+                CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
+                s_Stress.phase = StressPhase::Done;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+#endif
+}
+
+} // namespace
+
 
 #ifdef NETPLAY
 // Maximum players supported by Kaillera
@@ -851,6 +1000,9 @@ static void FrameCallback(unsigned int frameIndex)
 
     // Frame Zero Phase 1 roundtrip test (no-op unless FRAME_ZERO_ROUNDTRIP=1)
     RoundtripTick();
+
+    // Frame Zero Phase 3 stress test (no-op unless FRAME_ZERO_STRESS=N)
+    StressTick();
 }
 
 // Kaillera PIF sync callback (called from mupen64plus-core after netplay sync)
@@ -1238,6 +1390,13 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
     {
         apply_kaillera_deterministic_settings();
     }
+#ifdef FRAME_ZERO
+    // Same gates apply to Frame Zero rollback. Active session => apply.
+    if (CoreGetFrameZeroSessionMode() != CoreFrameZero::SessionMode::None)
+    {
+        apply_frame_zero_deterministic_settings();
+    }
+#endif
 
     // Kaillera connection happens BEFORE emulation via kailleraSelectServerDialog
     // Just verify it's initialized if netplay was requested
@@ -1286,6 +1445,9 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
         // Frame Zero Phase 1 roundtrip test (no-op unless FRAME_ZERO_ROUNDTRIP=1).
         RoundtripArm();
 
+        // Frame Zero Phase 3 stress test (no-op unless FRAME_ZERO_STRESS=N).
+        StressArm();
+
 #ifdef NETPLAY
         // Reset Kaillera sync state to prevent stale cache from previous sessions
         s_LastSyncFrame = -1;
@@ -1297,22 +1459,32 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
 #endif
 
 #ifdef NETPLAY
-        // Register Kaillera PIF sync callback (works with any input plugin)
-        // Get function pointer dynamically since mupen64plus is loaded at runtime
-        typedef void (*set_pif_sync_callback_t)(pif_sync_callback_t);
-        void* coreHandle = m64p::Core.GetHandle();
-        if (coreHandle)
-        {
-#ifdef _WIN32
-            set_pif_sync_callback_t set_callback =
-                (set_pif_sync_callback_t)GetProcAddress((HMODULE)coreHandle, "set_pif_sync_callback");
-#else
-            set_pif_sync_callback_t set_callback =
-                (set_pif_sync_callback_t)dlsym(coreHandle, "set_pif_sync_callback");
+        // Register Kaillera PIF sync callback (works with any input plugin).
+        // Frame Zero installs its own callback when CoreStartFrameZeroStressSession
+        // is called; if a Frame Zero session is already active we leave that
+        // callback in place rather than overriding it with Kaillera's.
+        bool fz_owns_pif = false;
+#ifdef FRAME_ZERO
+        fz_owns_pif = (CoreGetFrameZeroSessionMode() != CoreFrameZero::SessionMode::None);
 #endif
-            if (set_callback)
+        if (!fz_owns_pif)
+        {
+            // Get function pointer dynamically since mupen64plus is loaded at runtime
+            typedef void (*set_pif_sync_callback_t)(pif_sync_callback_t);
+            void* coreHandle = m64p::Core.GetHandle();
+            if (coreHandle)
             {
-                set_callback(KailleraPifSyncCallback);
+#ifdef _WIN32
+                set_pif_sync_callback_t set_callback =
+                    (set_pif_sync_callback_t)GetProcAddress((HMODULE)coreHandle, "set_pif_sync_callback");
+#else
+                set_pif_sync_callback_t set_callback =
+                    (set_pif_sync_callback_t)dlsym(coreHandle, "set_pif_sync_callback");
+#endif
+                if (set_callback)
+                {
+                    set_callback(KailleraPifSyncCallback);
+                }
             }
         }
 #endif

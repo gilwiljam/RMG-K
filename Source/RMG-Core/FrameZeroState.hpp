@@ -53,6 +53,15 @@ bool slotIsValid(int slot);
  * via captureState() or freed via stateShutdown(). */
 bool slotBytes(int slot, const uint8_t** out_data, size_t* out_len);
 
+/* Capture current emulator state into a caller-provided buffer.
+ * dst_len must be >= stateSnapshotSize(). On success out_len holds the
+ * actual bytes written. Used by GekkoNet's SaveEvent handler. */
+bool captureToBuffer(uint8_t* dst, size_t dst_len, size_t* out_len);
+
+/* Restore emulator state from a caller-provided buffer. Used by
+ * GekkoNet's LoadEvent handler — the buffer is owned by GekkoNet. */
+bool restoreFromBuffer(const uint8_t* src, size_t len);
+
 } // namespace FrameZero
 
 #endif // CORE_INTERNAL

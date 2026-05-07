@@ -85,6 +85,36 @@ EXPORT int  CALL core_get_rollback_mode(void);
 EXPORT void CALL core_set_input_neutralize(int v);
 EXPORT int  CALL core_get_input_neutralize(void);
 
+/* Frame Zero: per-frame pump callback fired from new_frame() on the
+ * emulation thread. RMG-Core sets this to drain GekkoNet events at
+ * each frame boundary. NULL means "no Frame Zero session active".
+ * Superseded by the pump-thread architecture (core_set_pump_driven)
+ * but kept for forward-compat — set to NULL when not in use. */
+typedef void (*m64p_frame_zero_pump)(unsigned int current_frame);
+EXPORT void CALL core_set_frame_zero_pump(m64p_frame_zero_pump cb);
+
+/* Frame Zero Phase 3.5 — pump-driven mode + park primitives.
+ *
+ * When pump-driven mode is enabled, new_frame() blocks at the frame
+ * boundary on a condition variable; an external "pump" thread wakes
+ * it for each frame. This lets the pump drive multi-frame inline
+ * rollback re-simulation that GekkoNet's update_session expects.
+ *
+ * Lifecycle:
+ *   1. RMG-Core spawns a pump thread, calls core_set_pump_driven(1)
+ *   2. Pump thread waits on core_wait_for_park()
+ *   3. Emulation thread reaches new_frame, parks
+ *   4. Pump thread wakes, processes events synchronously
+ *   5. For each Advance, pump calls core_resume_emulation_one_frame()
+ *      then core_wait_for_park() to drive exactly one frame
+ *   6. Shutdown: core_signal_pump_shutdown() unblocks both sides;
+ *      RMG-Core joins pump thread; calls core_set_pump_driven(0). */
+EXPORT void CALL core_set_pump_driven(int v);
+EXPORT void CALL core_resume_emulation_one_frame(void);
+EXPORT int  CALL core_wait_for_park(void);
+EXPORT void CALL core_signal_pump_shutdown(void);
+EXPORT void CALL core_clear_pump_shutdown(void);
+
 /* Read by input_plugin_compat.c. */
 extern int g_FrameZero_NeutralizeInput;
 
