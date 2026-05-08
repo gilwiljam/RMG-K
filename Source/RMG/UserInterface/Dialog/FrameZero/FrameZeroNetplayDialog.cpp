@@ -5,7 +5,6 @@
 
 #include <QApplication>
 #include <QButtonGroup>
-#include <QCheckBox>
 #include <QElapsedTimer>
 #include <QFormLayout>
 #include <QFontMetrics>
@@ -109,28 +108,9 @@ void FrameZeroNetplayDialog::setupUI()
     m_modeHintLabel->setWordWrap(true);
     m_modeHintLabel->setTextFormat(Qt::RichText);
 
-    /* Input delay UI: a single "Auto" checkbox by default, with a
-     * hidden manual spinner that reveals when the user un-checks Auto.
-     * Auto picks from the handshake RTT once the connect completes —
-     * Slippi-style. The hint label tells the user which value will be
-     * used so the choice is visible without exposing the whole knob. */
-    m_inputDelayAuto = new QCheckBox("Auto-detect from connection (recommended)", localBox);
-    m_inputDelayAuto->setChecked(true);
-    m_inputDelayAuto->setToolTip("When checked, input delay is picked from the round-trip "
-                                 "time measured during the handshake. Mirrors Slippi's "
-                                 "behaviour for online play. Uncheck to pin a manual value.");
-
-    m_inputDelaySpin = new QSpinBox(localBox);
-    m_inputDelaySpin->setRange(0, 9);
-    m_inputDelaySpin->setSuffix(" frames");
-    m_inputDelaySpin->setValue(1);
-    m_inputDelaySpin->setVisible(false);
-    m_inputDelaySpin->setToolTip("Manual input delay override (0..9 frames). Higher delay = "
-                                 "wider prediction window = more rollback work per frame.");
-
-    m_inputDelayHint = new QLabel(localBox);
-    m_inputDelayHint->setTextFormat(Qt::RichText);
-    m_inputDelayHint->setText("<i>Auto: will be set from RTT after connect.</i>");
+    /* Input delay is fully automatic — picked from the handshake RTT
+     * after Connect, no UI surface. See
+     * MainWindow::pollFrameZeroConnectStatus for the formula. */
 
     m_timeoutSpin = new QSpinBox(localBox);
     m_timeoutSpin->setRange(5, 600);
@@ -148,9 +128,6 @@ void FrameZeroNetplayDialog::setupUI()
     localForm->addRow("Local UDP port:", m_localPortSpin);
     localForm->addRow("Mode:",           modeRow);
     localForm->addRow("",                m_modeHintLabel);
-    localForm->addRow("Input delay:",    m_inputDelayAuto);
-    localForm->addRow("",                m_inputDelaySpin);
-    localForm->addRow("",                m_inputDelayHint);
     localForm->addRow("Handshake timeout:", m_timeoutSpin);
     localForm->addRow("Share with peer:", m_localAddrLabel);
 
@@ -215,19 +192,6 @@ void FrameZeroNetplayDialog::setupUI()
     connect(m_peerHistoryList, &QListWidget::itemDoubleClicked, this, &FrameZeroNetplayDialog::onPeerHistoryActivated);
     connect(m_localPortSpin, qOverload<int>(&QSpinBox::valueChanged),
             this, [this](int) { refreshLocalAddressLabel(); });
-    connect(m_inputDelayAuto, &QCheckBox::toggled, this, [this](bool checked) {
-        m_inputDelaySpin->setVisible(!checked);
-        if (checked)
-        {
-            m_inputDelayHint->setText(
-                "<i>Auto: will be set from RTT after connect.</i>");
-        }
-        else
-        {
-            m_inputDelayHint->setText(
-                "<i>Manual override active.</i>");
-        }
-    });
     connect(m_modeHostRadio, &QRadioButton::toggled,
             this, [this](bool) { onModeChanged(); });
     connect(m_modeJoinRadio, &QRadioButton::toggled,
@@ -296,8 +260,6 @@ void FrameZeroNetplayDialog::loadSettings()
     const int         hostPort  = CoreSettingsGetIntValue(SettingsID::FrameZero_LocalPort);
     const int         joinPort  = CoreSettingsGetIntValue(SettingsID::FrameZero_LocalPort_Join);
     const int         modeInt   = CoreSettingsGetIntValue(SettingsID::FrameZero_Mode);
-    const int         inputDelay = CoreSettingsGetIntValue(SettingsID::FrameZero_InputDelay);
-    const bool        inputDelayAuto = CoreSettingsGetBoolValue(SettingsID::FrameZero_InputDelayAuto);
     const int         timeoutS  = CoreSettingsGetIntValue(SettingsID::FrameZero_TimeoutSeconds);
     const std::string lastPeer  = CoreSettingsGetStringValue(SettingsID::FrameZero_LastPeer);
 
@@ -318,16 +280,6 @@ void FrameZeroNetplayDialog::loadSettings()
     }
     setCurrentMode(savedMode);
 
-    if (inputDelay >= 0 && inputDelay <= 9) m_inputDelaySpin->setValue(inputDelay);
-    m_inputDelayAuto->setChecked(inputDelayAuto);
-    /* Trigger the toggled handler manually so the spinner visibility +
-     * hint label match the loaded state — setChecked only emits
-     * toggled when the value actually changes, which it doesn't on
-     * first run since the default is true. */
-    m_inputDelaySpin->setVisible(!inputDelayAuto);
-    m_inputDelayHint->setText(inputDelayAuto
-        ? "<i>Auto: will be set from RTT after connect.</i>"
-        : "<i>Manual override active.</i>");
     if (timeoutS  >= 5 && timeoutS  <= 600) m_timeoutSpin->setValue(timeoutS);
     m_peerEdit->setText(QString::fromStdString(lastPeer));
 
@@ -361,10 +313,6 @@ void FrameZeroNetplayDialog::saveSettings()
                          m_joinPort);
     CoreSettingsSetValue(SettingsID::FrameZero_Mode,
                          static_cast<int>(currentMode()));
-    CoreSettingsSetValue(SettingsID::FrameZero_InputDelay,
-                         m_inputDelaySpin->value());
-    CoreSettingsSetValue(SettingsID::FrameZero_InputDelayAuto,
-                         m_inputDelayAuto->isChecked());
     CoreSettingsSetValue(SettingsID::FrameZero_TimeoutSeconds,
                          m_timeoutSpin->value());
     CoreSettingsSetValue(SettingsID::FrameZero_LastPeer,
@@ -680,7 +628,6 @@ void FrameZeroNetplayDialog::onConnect()
     m_localPort       = m_localPortSpin->value();
     m_localSlot       = (currentMode() == Mode::Host) ? 0 : 1;
     m_timeoutSec      = m_timeoutSpin->value();
-    m_autoInputDelay  = m_inputDelayAuto->isChecked();
     m_peerResolved    = resolved;
 
     // Push to env vars so the existing tryFrameZeroConnect() +
@@ -691,8 +638,11 @@ void FrameZeroNetplayDialog::onConnect()
     setEnvVar("FRAME_ZERO_ONLINE_PORT",    std::to_string(m_localPort));
     setEnvVar("FRAME_ZERO_ONLINE_PEERS",   resolved.toStdString());
     setEnvVar("FRAME_ZERO_ONLINE_LOCAL",   std::to_string(m_localSlot));
-    setEnvVar("FRAME_ZERO_ONLINE_DELAY",   std::to_string(m_inputDelaySpin->value()));
     setEnvVar("FRAME_ZERO_ONLINE_TIMEOUT", std::to_string(m_timeoutSec));
+    /* FRAME_ZERO_ONLINE_DELAY is set later in
+     * MainWindow::pollFrameZeroConnectStatus once the handshake RTT is
+     * known. Leaving it unset here (or pre-existing from a prior run)
+     * — OnlineArm has its own default fallback. */
 
     appendPeerHistory(resolved);
     saveSettings();

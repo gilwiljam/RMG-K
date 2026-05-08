@@ -2773,7 +2773,6 @@ void MainWindow::on_Action_Netplay_BrowseSessions(void)
     Dialog::FrameZeroNetplayDialog dlg(this);
     if (dlg.exec() == QDialog::Accepted && dlg.acceptedConnect())
     {
-        this->ui_FrameZeroAutoDelayPending = dlg.autoInputDelay();
         this->tryFrameZeroConnect();
     }
 #endif // NETPLAY
@@ -3262,10 +3261,9 @@ void MainWindow::pollFrameZeroConnectStatus(void)
          * ~32 ms RTT, clamped to [1, 4]. The OnlineArm in
          * Emulation.cpp reads FRAME_ZERO_ONLINE_DELAY at session
          * start, so overriding here before launchEmulationThread is
-         * the right hook. */
-        if (this->ui_FrameZeroAutoDelayPending)
+         * the right hook. Unconditional — the dialog has no manual
+         * override surface. */
         {
-            this->ui_FrameZeroAutoDelayPending = false;
             const int rtt = CoreFrameZeroConnectGetMedianRttMs();
             int delay = 2; /* fallback if measurement failed */
             if (rtt >= 0)

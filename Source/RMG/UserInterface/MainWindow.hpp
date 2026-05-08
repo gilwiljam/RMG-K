@@ -152,11 +152,6 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
      * FRAME_ZERO_ONLINE=1 env var was found at startup. showEvent()
      * schedules the connect attempt after a delay. */
     bool ui_FrameZeroConnectPending = false;
-    /* When true, pollFrameZeroConnectStatus reads the median handshake
-     * RTT once status flips to Connected and overrides
-     * FRAME_ZERO_ONLINE_DELAY before launching emulation. Set from
-     * the dialog's autoInputDelay() flag. */
-    bool ui_FrameZeroAutoDelayPending = false;
     QTimer* ui_FrameZeroPollTimer  = nullptr;
     /* Resolved ROM file path, cached between tryFrameZeroConnect (which
      * looks the ROM up + reads its MD5 for the handshake identity tag)

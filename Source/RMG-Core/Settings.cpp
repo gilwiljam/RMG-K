@@ -333,15 +333,6 @@ static l_Setting get_setting(SettingsID settingId)
     case SettingsID::FrameZero_Mode:
         setting = {SETTING_SECTION_FRAMEZERO, "Mode", 0}; // 0=Host (P1), 1=Join (P2)
         break;
-    case SettingsID::FrameZero_InputDelay:
-        // 0..9 GekkoNet local delay. Used only when InputDelayAuto is
-        // false; otherwise the value is auto-picked from the handshake
-        // RTT each session.
-        setting = {SETTING_SECTION_FRAMEZERO, "InputDelay", 1};
-        break;
-    case SettingsID::FrameZero_InputDelayAuto:
-        setting = {SETTING_SECTION_FRAMEZERO, "InputDelayAuto", true};
-        break;
     case SettingsID::FrameZero_TimeoutSeconds:
         setting = {SETTING_SECTION_FRAMEZERO, "TimeoutSeconds", 60};
         break;

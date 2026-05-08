@@ -1,7 +1,6 @@
 #ifndef FRAMEZERO_NETPLAY_DIALOG_HPP
 #define FRAMEZERO_NETPLAY_DIALOG_HPP
 
-#include <QCheckBox>
 #include <QDialog>
 #include <QLineEdit>
 #include <QSpinBox>
@@ -61,12 +60,6 @@ public:
     int                       timeoutSeconds()  const { return m_timeoutSec; }
     QString                   peer()            const { return m_peerResolved; }
 
-    // True when the user wants the input delay auto-picked from the
-    // measured round-trip after the handshake completes. False means
-    // the FRAME_ZERO_ONLINE_DELAY env var the dialog set should be
-    // honoured as-is.
-    bool                      autoInputDelay()  const { return m_autoInputDelay; }
-
 private slots:
     void onLookupCode();
     void onConnect();
@@ -106,9 +99,6 @@ private:
     QRadioButton* m_modeJoinRadio   = nullptr;
     QButtonGroup* m_modeGroup       = nullptr;
     QLabel*       m_modeHintLabel   = nullptr;
-    QCheckBox*    m_inputDelayAuto  = nullptr;
-    QSpinBox*     m_inputDelaySpin  = nullptr;
-    QLabel*       m_inputDelayHint  = nullptr;
     QSpinBox*     m_timeoutSpin     = nullptr;
     QLabel*       m_localAddrLabel  = nullptr;
     QLineEdit*    m_peerEdit        = nullptr;
@@ -122,7 +112,6 @@ private:
     int     m_localPort       = 7000;
     int     m_localSlot       = 0;
     int     m_timeoutSec      = 60;
-    bool    m_autoInputDelay  = true;
     QString m_peerResolved; // "ip:port" after Connect succeeds
 
     // Per-mode port memory. The spinner shows the value for the

@@ -295,6 +295,15 @@ static void worker(unsigned short local_port,
                         g_status.store(CoreFrameZero::ConnectStatus::RomMismatch);
                         return;
                     }
+                    /* Acknowledge immediately. The original code only
+                     * sent ACKs in the 100 ms HELLO loop tick, which
+                     * meant the peer's measured RTT was dominated by
+                     * the up-to-100 ms ACK-batching delay rather than
+                     * the actual network round-trip. Retrying in the
+                     * 100 ms loop is still fine for redundancy under
+                     * packet loss. */
+                    sendto(sock, kAck, (int)std::strlen(kAck), 0,
+                           (const sockaddr*)&from, from_len);
                     hello_received.insert(from_canon);
                 }
                 else if (std::strncmp(buf, kAck, std::strlen(kAck)) == 0)

@@ -103,11 +103,6 @@ enum class SettingsID
                                 // by default so two RMG-K instances on the
                                 // same machine can bind without colliding.
     FrameZero_Mode,
-    FrameZero_InputDelay,
-    FrameZero_InputDelayAuto,   // bool — when true the input delay is
-                                // auto-picked from RTT measured during
-                                // the handshake; when false the manual
-                                // value above is used as-is.
     FrameZero_TimeoutSeconds,
     FrameZero_LastPeer,
     FrameZero_PeerHistory,
