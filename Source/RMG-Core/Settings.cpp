@@ -330,6 +330,9 @@ static l_Setting get_setting(SettingsID settingId)
     case SettingsID::FrameZero_LocalSlot:
         setting = {SETTING_SECTION_FRAMEZERO, "LocalSlot", 0}; // 0=P1, 1=P2
         break;
+    case SettingsID::FrameZero_InputDelay:
+        setting = {SETTING_SECTION_FRAMEZERO, "InputDelay", 2}; // 0..9 GekkoNet local delay
+        break;
     case SettingsID::FrameZero_TimeoutSeconds:
         setting = {SETTING_SECTION_FRAMEZERO, "TimeoutSeconds", 60};
         break;

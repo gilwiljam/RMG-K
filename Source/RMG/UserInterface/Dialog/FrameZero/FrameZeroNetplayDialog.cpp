@@ -82,6 +82,14 @@ void FrameZeroNetplayDialog::setupUI()
     m_localSlotCombo->addItem("Player 1", 0);
     m_localSlotCombo->addItem("Player 2", 1);
 
+    m_inputDelaySpin = new QSpinBox(localBox);
+    m_inputDelaySpin->setRange(0, 9);
+    m_inputDelaySpin->setSuffix(" frames");
+    m_inputDelaySpin->setValue(2);
+    m_inputDelaySpin->setToolTip("Frames of artificial input delay added by GekkoNet. "
+                                 "Higher delay = less rollback work but more felt input lag. "
+                                 "2 is the typical default.");
+
     m_timeoutSpin = new QSpinBox(localBox);
     m_timeoutSpin->setRange(5, 600);
     m_timeoutSpin->setSuffix(" s");
@@ -97,6 +105,7 @@ void FrameZeroNetplayDialog::setupUI()
     localForm->addRow("Username:",       m_usernameEdit);
     localForm->addRow("Local UDP port:", m_localPortSpin);
     localForm->addRow("Play as:",        m_localSlotCombo);
+    localForm->addRow("Input delay:",    m_inputDelaySpin);
     localForm->addRow("Handshake timeout:", m_timeoutSpin);
     localForm->addRow("Share with peer:", m_localAddrLabel);
 
@@ -171,12 +180,14 @@ void FrameZeroNetplayDialog::loadSettings()
     const std::string username  = CoreSettingsGetStringValue(SettingsID::FrameZero_Username);
     const int         localPort = CoreSettingsGetIntValue(SettingsID::FrameZero_LocalPort);
     const int         localSlot = CoreSettingsGetIntValue(SettingsID::FrameZero_LocalSlot);
+    const int         inputDelay = CoreSettingsGetIntValue(SettingsID::FrameZero_InputDelay);
     const int         timeoutS  = CoreSettingsGetIntValue(SettingsID::FrameZero_TimeoutSeconds);
     const std::string lastPeer  = CoreSettingsGetStringValue(SettingsID::FrameZero_LastPeer);
 
     m_usernameEdit->setText(QString::fromStdString(username));
     if (localPort >= 1024 && localPort <= 65535) m_localPortSpin->setValue(localPort);
     if (localSlot == 0 || localSlot == 1) m_localSlotCombo->setCurrentIndex(localSlot);
+    if (inputDelay >= 0 && inputDelay <= 9) m_inputDelaySpin->setValue(inputDelay);
     if (timeoutS  >= 5 && timeoutS  <= 600) m_timeoutSpin->setValue(timeoutS);
     m_peerEdit->setText(QString::fromStdString(lastPeer));
 
@@ -203,6 +214,8 @@ void FrameZeroNetplayDialog::saveSettings()
                          m_localPortSpin->value());
     CoreSettingsSetValue(SettingsID::FrameZero_LocalSlot,
                          m_localSlotCombo->currentIndex());
+    CoreSettingsSetValue(SettingsID::FrameZero_InputDelay,
+                         m_inputDelaySpin->value());
     CoreSettingsSetValue(SettingsID::FrameZero_TimeoutSeconds,
                          m_timeoutSpin->value());
     CoreSettingsSetValue(SettingsID::FrameZero_LastPeer,
@@ -527,6 +540,7 @@ void FrameZeroNetplayDialog::onConnect()
     setEnvVar("FRAME_ZERO_ONLINE_PORT",    std::to_string(m_localPort));
     setEnvVar("FRAME_ZERO_ONLINE_PEERS",   resolved.toStdString());
     setEnvVar("FRAME_ZERO_ONLINE_LOCAL",   std::to_string(m_localSlot));
+    setEnvVar("FRAME_ZERO_ONLINE_DELAY",   std::to_string(m_inputDelaySpin->value()));
     setEnvVar("FRAME_ZERO_ONLINE_TIMEOUT", std::to_string(m_timeoutSec));
 
     appendPeerHistory(resolved);

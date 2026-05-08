@@ -87,6 +87,7 @@ private:
     QLineEdit*    m_usernameEdit    = nullptr;
     QSpinBox*     m_localPortSpin   = nullptr;
     QComboBox*    m_localSlotCombo  = nullptr;
+    QSpinBox*     m_inputDelaySpin  = nullptr;
     QSpinBox*     m_timeoutSpin     = nullptr;
     QLabel*       m_localAddrLabel  = nullptr;
     QLineEdit*    m_peerEdit        = nullptr;

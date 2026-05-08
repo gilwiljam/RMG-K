@@ -100,6 +100,7 @@ enum class SettingsID
     FrameZero_Username,
     FrameZero_LocalPort,
     FrameZero_LocalSlot,
+    FrameZero_InputDelay,
     FrameZero_TimeoutSeconds,
     FrameZero_LastPeer,
     FrameZero_PeerHistory,
