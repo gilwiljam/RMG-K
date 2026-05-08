@@ -637,8 +637,15 @@ void FrameZeroNetplayDialog::onFindMatch()
     constexpr quint16 kJoinPort = 7001;
 
     auto canBind = [](quint16 port) {
+        /* Probe with AnyIPv4 (INADDR_ANY) so the probe matches what
+         * FrameZeroConnect will actually try. Probing LocalHost looks
+         * tempting but Windows treats specific-interface and
+         * INADDR_ANY binds as distinct — a probe of 127.0.0.1:port
+         * can succeed while another process already holds
+         * 0.0.0.0:port, which is exactly the case the second instance
+         * hits in localhost two-instance testing. */
         QUdpSocket s;
-        const bool ok = s.bind(QHostAddress::LocalHost, port);
+        const bool ok = s.bind(QHostAddress::AnyIPv4, port);
         s.close();
         return ok;
     };
