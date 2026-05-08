@@ -95,6 +95,8 @@ core_signal_pump_shutdown;
 core_clear_pump_shutdown;
 core_read_rdram_word;
 core_write_rdram_word;
+core_set_frame_zero_speed_adjust;
+core_get_frame_zero_speed_adjust;
 savestates_get_state_size;
 savestates_save_to_buffer;
 savestates_load_from_buffer;

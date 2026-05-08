@@ -120,6 +120,7 @@ typedef void (*core_resume_emu_t)(void);
 typedef int  (*core_wait_for_park_t)(void);
 typedef void (*core_signal_shutdown_t)(void);
 typedef void (*core_clear_shutdown_t)(void);
+typedef void (*core_set_speed_adjust_t)(double);
 
 set_pif_sync_callback_t         g_set_pif_sync = nullptr;
 core_set_frame_zero_pump_t      g_set_pump     = nullptr;
@@ -129,6 +130,7 @@ core_resume_emu_t               g_resume_emu        = nullptr;
 core_wait_for_park_t            g_wait_for_park     = nullptr;
 core_signal_shutdown_t          g_signal_shutdown   = nullptr;
 core_clear_shutdown_t            g_clear_shutdown   = nullptr;
+core_set_speed_adjust_t         g_set_speed_adjust = nullptr;
 bool                            g_attached     = false;
 
 /* Pump thread state. */
@@ -180,6 +182,10 @@ bool fz_resolve_core_hooks()
         fz_resolve_sym(handle, "core_signal_pump_shutdown");
     g_clear_shutdown = (core_clear_shutdown_t)
         fz_resolve_sym(handle, "core_clear_pump_shutdown");
+    g_set_speed_adjust = (core_set_speed_adjust_t)
+        fz_resolve_sym(handle, "core_set_frame_zero_speed_adjust");
+    /* g_set_speed_adjust is optional — old core builds without the
+     * symbol still work, just without auto-stall. */
 
     return (g_set_pif_sync != nullptr && g_set_pump != nullptr && g_set_rollback != nullptr &&
             g_set_pump_driven != nullptr && g_resume_emu != nullptr && g_wait_for_park != nullptr &&
@@ -603,25 +609,31 @@ static void fz_pump_one_frame(unsigned int current_frame)
     }
     (void)current_frame;
 
-    /* Frame-advantage telemetry. Logs every ~5 s when online and the
-     * skew exceeds ±0.5 frames — i.e. in the regime where GekkoNet's
-     * own time-sync would tell the example integration to slow down.
-     * Silent when both peers are pacing in lock-step (the common
-     * case), noisy enough to surface a runaway-host condition before
-     * users notice it as input lag. Online sessions only — stress and
-     * spectator modes use different pacing. */
-    if (g_mode == CoreFrameZero::SessionMode::Online &&
-        n_advance > 0 &&
-        (g_pump_call_count % 300) == 0)
+    /* Frame-advantage governance (Cannon's GGPO article). GekkoNet
+     * maintains the per-peer skew average; we read it on every pump
+     * call and nudge the speed limiter so the local sim slows ~1.6 %
+     * when we're more than half a frame ahead. Symmetric stalling
+     * oscillates per Cannon, so we only slow when ahead and let the
+     * peer's own pacing pull us forward when behind.
+     *
+     * Telemetry: ~5 s log when |skew| > 0.5 so a persistent skew is
+     * visible in the log even after the limiter clamps it. */
+    if (g_mode == CoreFrameZero::SessionMode::Online && n_advance > 0)
     {
         const float ahead = gekko_frames_ahead(g_session);
-        if (ahead > 0.5f || ahead < -0.5f)
+        if (g_set_speed_adjust != nullptr)
         {
-            char buf[160];
+            const double adjust = (ahead > 0.5f) ? 1.016 : 1.0;
+            g_set_speed_adjust(adjust);
+        }
+        if ((g_pump_call_count % 300) == 0 && (ahead > 0.5f || ahead < -0.5f))
+        {
+            char buf[176];
             std::snprintf(buf, sizeof(buf),
-                "[FrameZero pacing] frame=%d frames_ahead=%+.2f (%s)",
+                "[FrameZero pacing] frame=%d frames_ahead=%+.2f (%s%s)",
                 last_adv_frame, ahead,
-                ahead > 0.0f ? "local is ahead" : "local is behind");
+                ahead > 0.0f ? "local is ahead" : "local is behind",
+                (ahead > 0.5f && g_set_speed_adjust != nullptr) ? ", slowing 1.6%" : "");
             CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
         }
     }
@@ -1043,6 +1055,10 @@ bool CoreEndFrameZeroSession(void)
     g_synced_have_data = false;
     g_synced_count = 0;
     g_local_input_valid.store(false, std::memory_order_relaxed);
+
+    /* Reset the speed-limiter nudge so single-player runs after a Frame
+     * Zero session aren't stuck pacing 1.6 % slow. */
+    if (g_set_speed_adjust != nullptr) g_set_speed_adjust(1.0);
     return true;
 #else
     return false;

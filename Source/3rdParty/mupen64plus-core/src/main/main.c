@@ -122,6 +122,15 @@ int g_RollbackMode = 0;
  * video and audio output visible during its advance phases. */
 int g_FrameZero_NeutralizeInput = 0;
 
+/* Frame Zero speed-adjust multiplier for the per-VI sleep window.
+ * 1.0 = normal pacing. >1.0 stretches each VI's nominal duration so the
+ * speed limiter sleeps longer, slowing the local sim. Used by Frame
+ * Zero to bring the local clock back in line with a peer that's
+ * running behind (per Cannon's GGPO-article frame-advantage logic).
+ * Read by apply_speed_limiter; set by core_set_frame_zero_speed_adjust.
+ * Reset to 1.0 whenever Frame Zero is not driving it. */
+double g_FrameZero_SpeedAdjust = 1.0;
+
 struct cheat_ctx g_cheat_ctx;
 
 /* g_mem_base is global to allow plugins early access (before device is initialized).
@@ -714,6 +723,21 @@ EXPORT int CALL core_get_input_neutralize(void)
     return g_FrameZero_NeutralizeInput;
 }
 
+EXPORT void CALL core_set_frame_zero_speed_adjust(double v)
+{
+    /* Clamp to a reasonable band — anything outside [0.9, 1.1] is
+     * either a buggy caller or a thrash that would feel worse than the
+     * skew it's trying to correct. */
+    if (v < 0.9)  v = 0.9;
+    if (v > 1.1)  v = 1.1;
+    g_FrameZero_SpeedAdjust = v;
+}
+
+EXPORT double CALL core_get_frame_zero_speed_adjust(void)
+{
+    return g_FrameZero_SpeedAdjust;
+}
+
 EXPORT void CALL core_set_frame_zero_pump(m64p_frame_zero_pump cb)
 {
     l_FrameZeroPump = cb;
@@ -1203,7 +1227,10 @@ static void apply_speed_limiter(void)
     // calculate frame duration based upon ROM setting (50/60hz) and mupen64plus speed adjustment
     const double VILimitMilliseconds = 1000.0 / g_dev.vi.expected_refresh_rate;
     const double SpeedFactorMultiple = defaultSpeedFactor/l_SpeedFactor;
-    const double AdjustedLimit = VILimitMilliseconds * SpeedFactorMultiple;
+    /* Frame Zero pacing nudge — multiplicative factor (1.0 = no-op) used
+     * by online sessions to slow the local sim when our frame-advantage
+     * vs the peer crosses the +0.5 threshold. */
+    const double AdjustedLimit = VILimitMilliseconds * SpeedFactorMultiple * g_FrameZero_SpeedAdjust;
 
     //if this is the first time or we are resuming from pause
     if(StartFPSTime == 0 || !resetOnce || lastSpeedFactor != l_SpeedFactor)
