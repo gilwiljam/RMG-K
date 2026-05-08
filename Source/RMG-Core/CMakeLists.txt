@@ -43,6 +43,7 @@ set(RMG_CORE_SOURCES
     FrameZeroConnect.cpp
     FrameZeroIPC.cpp
     FrameZeroState.cpp
+    N02Traversal.cpp
     Plugins.cpp
     Version.cpp
     Cheats.cpp
