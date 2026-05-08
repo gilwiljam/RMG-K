@@ -111,10 +111,12 @@ void FrameZeroNetplayDialog::setupUI()
     m_inputDelaySpin = new QSpinBox(localBox);
     m_inputDelaySpin->setRange(0, 9);
     m_inputDelaySpin->setSuffix(" frames");
-    m_inputDelaySpin->setValue(2);
+    m_inputDelaySpin->setValue(1);
     m_inputDelaySpin->setToolTip("Frames of artificial input delay added by GekkoNet. "
-                                 "Higher delay = less rollback work but more felt input lag. "
-                                 "2 is the typical default.");
+                                 "Higher delay = wider prediction window = more rollback work "
+                                 "per frame. 1 is what we've validated; 2+ doubles save/load "
+                                 "cost per pump tick and currently surfaces an unresolved "
+                                 "determinism bug.");
 
     m_timeoutSpin = new QSpinBox(localBox);
     m_timeoutSpin->setRange(5, 600);
