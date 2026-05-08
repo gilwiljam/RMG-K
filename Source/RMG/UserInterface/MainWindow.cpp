@@ -2773,6 +2773,7 @@ void MainWindow::on_Action_Netplay_BrowseSessions(void)
     Dialog::FrameZeroNetplayDialog dlg(this);
     if (dlg.exec() == QDialog::Accepted && dlg.acceptedConnect())
     {
+        this->ui_FrameZeroAutoDelayPending = dlg.autoInputDelay();
         this->tryFrameZeroConnect();
     }
 #endif // NETPLAY
@@ -3253,6 +3254,38 @@ void MainWindow::pollFrameZeroConnectStatus(void)
 #else
         setenv("FRAME_ZERO_ONLINE_SETTLE", "1", 1);
 #endif
+
+        /* Slippi-style auto input delay: read the median RTT measured
+         * during the handshake and pick a delay that absorbs typical
+         * jitter at this connection quality. Formula matches the
+         * canonical rollback rule of thumb — one frame of delay per
+         * ~32 ms RTT, clamped to [1, 4]. The OnlineArm in
+         * Emulation.cpp reads FRAME_ZERO_ONLINE_DELAY at session
+         * start, so overriding here before launchEmulationThread is
+         * the right hook. */
+        if (this->ui_FrameZeroAutoDelayPending)
+        {
+            this->ui_FrameZeroAutoDelayPending = false;
+            const int rtt = CoreFrameZeroConnectGetMedianRttMs();
+            int delay = 2; /* fallback if measurement failed */
+            if (rtt >= 0)
+            {
+                delay = (rtt + 31) / 32; /* ceil(rtt/32) */
+                if (delay < 1) delay = 1;
+                if (delay > 4) delay = 4;
+            }
+            const std::string delayStr = std::to_string(delay);
+#ifdef _WIN32
+            _putenv_s("FRAME_ZERO_ONLINE_DELAY", delayStr.c_str());
+#else
+            setenv("FRAME_ZERO_ONLINE_DELAY", delayStr.c_str(), 1);
+#endif
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                "[FrameZero] auto-delay: median RTT %d ms → %d frame%s",
+                rtt, delay, delay == 1 ? "" : "s");
+            CoreAddCallbackMessage(CoreDebugMessageType::Info, buf);
+        }
 
         /* Launch emulation. The OnlineArm harness inside
          * Emulation.cpp picks up the env vars and opens the GekkoNet

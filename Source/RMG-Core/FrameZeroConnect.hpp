@@ -80,4 +80,11 @@ CORE_EXPORT CoreFrameZero::ConnectStatus CoreFrameZeroConnectGetStatus(void);
 // Joins the worker thread (waits up to a few hundred ms). Idempotent.
 CORE_EXPORT void CoreFrameZeroConnectStop(void);
 
+// Median round-trip time across the handshake's HELLO/ACK exchange,
+// in milliseconds. Returns -1 when no samples have been collected
+// (handshake hasn't run, no ACKs received yet). Used to pick a
+// suitable input-delay value for the GekkoNet session — see
+// MainWindow::pollFrameZeroConnectStatus.
+CORE_EXPORT int CoreFrameZeroConnectGetMedianRttMs(void);
+
 #endif // CORE_FRAMEZEROCONNECT_HPP

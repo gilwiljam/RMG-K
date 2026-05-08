@@ -4,6 +4,7 @@
 
 #include "Callback.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -48,6 +49,18 @@ std::atomic<bool>                          g_should_stop{false};
 std::thread                                g_worker;
 std::mutex                                 g_remote_identity_mu;
 std::string                                g_remote_identity;
+
+/* RTT samples collected during the handshake. Updated whenever an
+ * ACK arrives — RTT estimated as (now - last_hello_send). The
+ * approximation error is bounded by the HELLO interval (100 ms) since
+ * the peer's ACK might correspond to an earlier HELLO than the most
+ * recent one we sent. Across multiple samples and given the median
+ * read, the bias washes out for the "what input delay should we
+ * pick?" decision. Samples are bounded — we only keep the last
+ * kRttSampleMax to keep median compute cheap. */
+constexpr size_t kRttSampleMax = 16;
+std::mutex                                 g_rtt_mu;
+std::vector<int>                           g_rtt_samples_ms;
 
 struct ParsedAddr
 {
@@ -192,6 +205,15 @@ static void worker(unsigned short local_port,
     const auto deadline = clock::now() + std::chrono::seconds(timeout_seconds);
     auto next_send = clock::now();
 
+    /* Reset RTT samples — leftover values from a prior session would
+     * skew the auto-delay decision for this one. */
+    {
+        std::lock_guard<std::mutex> lk(g_rtt_mu);
+        g_rtt_samples_ms.clear();
+    }
+
+    auto last_hello_send = clock::now();
+
     while (clock::now() < deadline && !g_should_stop.load())
     {
         const auto now = clock::now();
@@ -212,6 +234,7 @@ static void worker(unsigned short local_port,
                            (const sockaddr*)&p.sa, sizeof(p.sa));
                 }
             }
+            last_hello_send = now;
             next_send = now + std::chrono::milliseconds(100);
         }
 
@@ -276,6 +299,22 @@ static void worker(unsigned short local_port,
                 }
                 else if (std::strncmp(buf, kAck, std::strlen(kAck)) == 0)
                 {
+                    /* RTT estimate. Bias bounded by HELLO interval
+                     * (100 ms): peer might be ACKing the HELLO before
+                     * the most recent one, but the median across
+                     * samples washes that out enough for the input-
+                     * delay decision. */
+                    const auto rtt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        clock::now() - last_hello_send).count();
+                    if (rtt >= 0 && rtt < 5000)
+                    {
+                        std::lock_guard<std::mutex> lk(g_rtt_mu);
+                        g_rtt_samples_ms.push_back((int)rtt);
+                        if (g_rtt_samples_ms.size() > kRttSampleMax)
+                        {
+                            g_rtt_samples_ms.erase(g_rtt_samples_ms.begin());
+                        }
+                    }
                     ack_received.insert(from_canon);
                 }
             }
@@ -402,4 +441,19 @@ void CoreFrameZeroConnectStop(void)
     {
         g_status.store(CoreFrameZero::ConnectStatus::Idle);
     }
+}
+
+int CoreFrameZeroConnectGetMedianRttMs(void)
+{
+    std::vector<int> samples;
+    {
+        std::lock_guard<std::mutex> lk(g_rtt_mu);
+        samples = g_rtt_samples_ms;
+    }
+    if (samples.empty()) return -1;
+
+    /* Median across the collected samples — robust against the
+     * single-HELLO-interval bias that can spike individual readings. */
+    std::sort(samples.begin(), samples.end());
+    return samples[samples.size() / 2];
 }

@@ -334,11 +334,13 @@ static l_Setting get_setting(SettingsID settingId)
         setting = {SETTING_SECTION_FRAMEZERO, "Mode", 0}; // 0=Host (P1), 1=Join (P2)
         break;
     case SettingsID::FrameZero_InputDelay:
-        // 0..9 GekkoNet local delay. 1 is the validated default — at 2+
-        // the prediction window widens and rollback cost per pump tick
-        // ~doubles, which both feels like half speed and surfaces a
-        // determinism bug we haven't tracked down yet.
+        // 0..9 GekkoNet local delay. Used only when InputDelayAuto is
+        // false; otherwise the value is auto-picked from the handshake
+        // RTT each session.
         setting = {SETTING_SECTION_FRAMEZERO, "InputDelay", 1};
+        break;
+    case SettingsID::FrameZero_InputDelayAuto:
+        setting = {SETTING_SECTION_FRAMEZERO, "InputDelayAuto", true};
         break;
     case SettingsID::FrameZero_TimeoutSeconds:
         setting = {SETTING_SECTION_FRAMEZERO, "TimeoutSeconds", 60};
