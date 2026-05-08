@@ -42,6 +42,7 @@ set(RMG_CORE_SOURCES
     FrameZero.cpp
     FrameZeroConnect.cpp
     FrameZeroIPC.cpp
+    FrameZeroNetShim.cpp
     FrameZeroState.cpp
     N02Traversal.cpp
     Plugins.cpp

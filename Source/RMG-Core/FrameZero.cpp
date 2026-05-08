@@ -4,9 +4,11 @@
 
 #include "Callback.hpp"
 #include "Error.hpp"
+#include "FrameZeroNetShim.hpp"
 #include "FrameZeroState.hpp"
 #include "m64p/Api.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -621,19 +623,39 @@ static void fz_pump_one_frame(unsigned int current_frame)
     if (g_mode == CoreFrameZero::SessionMode::Online && n_advance > 0)
     {
         const float ahead = gekko_frames_ahead(g_session);
-        if (g_set_speed_adjust != nullptr)
+        double adjust = 1.0;
+        if (ahead > 0.0f)
         {
-            const double adjust = (ahead > 0.5f) ? 1.016 : 1.0;
-            g_set_speed_adjust(adjust);
+            /* Proportional brake. Linear in `ahead` rather than the
+             * earlier 0.5-frame deadzone, which oscillated: skew >0.5
+             * fired the brake, brake closed gap to ~0.4, brake released,
+             * rollback overhead pushed back over 0.5, repeat. With a
+             * proportional signal the brake stays partially engaged at
+             * any positive skew so the gap doesn't re-open. Slope 1 %
+             * per frame ahead, capped at +2.5 % so we don't lurch the
+             * sim if a short measurement spike hits. */
+            adjust = 1.0 + std::min(0.025, 0.01 * (double)ahead);
         }
+        if (g_set_speed_adjust != nullptr) g_set_speed_adjust(adjust);
+
         if ((g_pump_call_count % 300) == 0 && (ahead > 0.5f || ahead < -0.5f))
         {
-            char buf[176];
+            char buf[200];
+            const double pct = (adjust - 1.0) * 100.0;
             std::snprintf(buf, sizeof(buf),
-                "[FrameZero pacing] frame=%d frames_ahead=%+.2f (%s%s)",
+                "[FrameZero pacing] frame=%d frames_ahead=%+.2f (%s%s%.2f%%)",
                 last_adv_frame, ahead,
                 ahead > 0.0f ? "local is ahead" : "local is behind",
-                (ahead > 0.5f && g_set_speed_adjust != nullptr) ? ", slowing 1.6%" : "");
+                ahead > 0.0f ? ", slowing " : "",
+                pct);
+            if (ahead <= 0.0f)
+            {
+                /* Recompute the message so we don't emit a stale "slowing
+                 * 0%" tail when behind. */
+                std::snprintf(buf, sizeof(buf),
+                    "[FrameZero pacing] frame=%d frames_ahead=%+.2f (local is behind)",
+                    last_adv_frame, ahead);
+            }
             CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
         }
     }
@@ -937,7 +959,10 @@ bool CoreStartFrameZeroOnlineSession(int num_players,
         g_session = nullptr;
         return false;
     }
-    gekko_net_adapter_set(g_session, adapter);
+    /* Optional latency/jitter/loss simulator (env-var driven). Returns
+     * `adapter` unchanged when no FRAME_ZERO_NETSIM_* var is set. */
+    GekkoNetAdapter* effective_adapter = FrameZeroNetShim::Wrap(adapter);
+    gekko_net_adapter_set(g_session, effective_adapter);
 
     /* Add actors in slot order. The local slot uses GekkoLocalPlayer
      * with the configured input delay; remote slots use the address
@@ -1059,6 +1084,10 @@ bool CoreEndFrameZeroSession(void)
     /* Reset the speed-limiter nudge so single-player runs after a Frame
      * Zero session aren't stuck pacing 1.6 % slow. */
     if (g_set_speed_adjust != nullptr) g_set_speed_adjust(1.0);
+
+    /* Drop any queued netsim packets and detach. No-op when netsim
+     * wasn't active. */
+    FrameZeroNetShim::Reset();
     return true;
 #else
     return false;
