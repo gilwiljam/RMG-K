@@ -74,6 +74,7 @@ private:
     QStringList loadPeerHistoryList() const;
 
     void setStatus(const QString& message, bool error);
+    void refreshLocalAddressLabel();
 
     bool resolvePeer(QString& outResolved, QString& outError);
     bool tryParseIpPort(const QString& text, QString& outIp, int& outPort) const;
@@ -87,6 +88,7 @@ private:
     QSpinBox*     m_localPortSpin   = nullptr;
     QComboBox*    m_localSlotCombo  = nullptr;
     QSpinBox*     m_timeoutSpin     = nullptr;
+    QLabel*       m_localAddrLabel  = nullptr;
     QLineEdit*    m_peerEdit        = nullptr;
     QListWidget*  m_peerHistoryList = nullptr;
     QPushButton*  m_btnLookup       = nullptr;

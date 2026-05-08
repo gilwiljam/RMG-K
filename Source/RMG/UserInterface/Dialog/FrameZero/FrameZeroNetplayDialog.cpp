@@ -12,6 +12,7 @@
 #include <QHostAddress>
 #include <QHostInfo>
 #include <QListWidgetItem>
+#include <QNetworkInterface>
 #include <QUdpSocket>
 #include <QVBoxLayout>
 
@@ -86,10 +87,18 @@ void FrameZeroNetplayDialog::setupUI()
     m_timeoutSpin->setSuffix(" s");
     m_timeoutSpin->setValue(60);
 
+    m_localAddrLabel = new QLabel(localBox);
+    m_localAddrLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_localAddrLabel->setWordWrap(true);
+    m_localAddrLabel->setToolTip("LAN addresses your peer can use to reach you. "
+                                 "For internet play you'll need to share your public IP "
+                                 "(or use a connect code).");
+
     localForm->addRow("Username:",       m_usernameEdit);
     localForm->addRow("Local UDP port:", m_localPortSpin);
     localForm->addRow("Play as:",        m_localSlotCombo);
     localForm->addRow("Handshake timeout:", m_timeoutSpin);
+    localForm->addRow("Share with peer:", m_localAddrLabel);
 
     root->addWidget(localBox);
 
@@ -150,8 +159,11 @@ void FrameZeroNetplayDialog::setupUI()
     connect(m_peerEdit,      &QLineEdit::textChanged, this, &FrameZeroNetplayDialog::onPeerTextChanged);
     connect(m_peerHistoryList, &QListWidget::itemActivated, this, &FrameZeroNetplayDialog::onPeerHistoryActivated);
     connect(m_peerHistoryList, &QListWidget::itemDoubleClicked, this, &FrameZeroNetplayDialog::onPeerHistoryActivated);
+    connect(m_localPortSpin, qOverload<int>(&QSpinBox::valueChanged),
+            this, [this](int) { refreshLocalAddressLabel(); });
 
-    resize(480, 420);
+    refreshLocalAddressLabel();
+    resize(480, 460);
 }
 
 void FrameZeroNetplayDialog::loadSettings()
@@ -225,6 +237,37 @@ void FrameZeroNetplayDialog::appendPeerHistory(const QString& peer)
     }
     CoreSettingsSetValue(SettingsID::FrameZero_PeerHistory,
                          history.join('\n').toStdString());
+}
+
+void FrameZeroNetplayDialog::refreshLocalAddressLabel()
+{
+    if (m_localAddrLabel == nullptr) return;
+
+    QStringList addrs;
+    for (const QHostAddress& a : QNetworkInterface::allAddresses())
+    {
+        if (a.protocol() != QAbstractSocket::IPv4Protocol) continue;
+        if (a.isLoopback()) continue;
+        if (a.isLinkLocal()) continue;
+        addrs << a.toString();
+    }
+
+    const int port = m_localPortSpin ? m_localPortSpin->value() : 7000;
+    if (addrs.isEmpty())
+    {
+        m_localAddrLabel->setText("<i>(no LAN address detected — only loopback "
+                                  "<code>127.0.0.1:" + QString::number(port) +
+                                  "</code> is available)</i>");
+        return;
+    }
+
+    QStringList lines;
+    lines.reserve(addrs.size());
+    for (const QString& ip : addrs)
+    {
+        lines << "<code>" + ip + ":" + QString::number(port) + "</code>";
+    }
+    m_localAddrLabel->setText(lines.join("&nbsp;&nbsp;"));
 }
 
 void FrameZeroNetplayDialog::setStatus(const QString& message, bool error)
