@@ -234,98 +234,121 @@ void fz_pif_sync_callback(struct fz_pif* pif)
     if (pif == nullptr)
         return;
 
-    /* Pre-session: hard-neutralize every channel. We do not know yet
-     * how many players the session will have, so neutralize all four
-     * physical channels — boot code reads them all. */
-    if (g_session == nullptr)
-    {
-        if (!g_neutralize_inputs.load(std::memory_order_relaxed))
-            return;
+    /* Channels 0..3 are the four N64 controller ports — that's what
+     * we override. Channel 4 is the cartridge EEPROM (game saves)
+     * and channel 5 is unused; we leave both alone. */
+    constexpr int kNumControllerChannels = 4;
 
-        for (int i = 0; i < 4; ++i)
-        {
-            if (pif->channels[i].tx == nullptr || pif->channels[i].rx == nullptr)
-                continue;
+    const bool active = (g_session != nullptr);
 
-            *pif->channels[i].rx &= ~0xC0;
-
-            const uint8_t cmd = pif->channels[i].tx_buf[0];
-            if (cmd == FZ_JCMD_STATUS || cmd == FZ_JCMD_RESET)
-            {
-                if (pif->channels[i].rx_buf != nullptr)
-                {
-                    const uint16_t type = 0x0500;  /* standard controller */
-                    pif->channels[i].rx_buf[0] = (uint8_t)(type & 0xFF);
-                    pif->channels[i].rx_buf[1] = (uint8_t)(type >> 8);
-                    pif->channels[i].rx_buf[2] = 0;
-                }
-            }
-            else if (cmd == FZ_JCMD_CONTROLLER_READ &&
-                     pif->channels[i].rx_buf != nullptr)
-            {
-                pif->channels[i].rx_buf[0] = 0;
-                pif->channels[i].rx_buf[1] = 0;
-                pif->channels[i].rx_buf[2] = 0;
-                pif->channels[i].rx_buf[3] = 0;
-            }
-        }
+    /* Pre-session pre-arm gating. */
+    if (!active && !g_neutralize_inputs.load(std::memory_order_relaxed))
         return;
+
+    /* In an active session, snapshot the local input from channel 0
+     * BEFORE we wipe rx_buf below. The input plugin always writes the
+     * physically-connected user's controller into channel 0
+     * regardless of the user's Frame Zero slot (Host/Join), so this
+     * is where the local input lives on both sides. We only need one
+     * read per frame; subsequent JCMD_CONTROLLER_READ polls in the
+     * same frame are served from the cache GekkoNet already provided. */
+    if (active && !g_pif_synced_this_frame)
+    {
+        const auto& ch0 = pif->channels[0];
+        if (ch0.tx     != nullptr && ch0.tx_buf != nullptr &&
+            ch0.rx_buf != nullptr &&
+            ch0.tx_buf[0] == FZ_JCMD_CONTROLLER_READ)
+        {
+            const uint8_t* rx = ch0.rx_buf;
+            const uint32_t local =
+                ((uint32_t)rx[0] << 24) |
+                ((uint32_t)rx[1] << 16) |
+                ((uint32_t)rx[2] <<  8) |
+                 (uint32_t)rx[3];
+            g_local_input_staged.store(local, std::memory_order_relaxed);
+            g_local_input_valid.store(true, std::memory_order_release);
+            g_pif_synced_this_frame = true;
+        }
     }
 
-    /* Active session — same logic as before. */
+    /* Frame Zero is the canonical authority on PIF rx state during a
+     * session — input plugins poll real hardware (USB HID adapters,
+     * etc.) and write their results, which differ between peers in
+     * subtle ways: controller-pak detection, rumble flags, status
+     * byte layouts, even how unplugged slots are reported. Those
+     * differences live in PIF RAM, get captured into the savestate,
+     * and produce a checksum mismatch on every frame even though the
+     * actual gameplay state is identical (the game ignores those
+     * bytes). To eliminate this entire class of cosmetic-but-noisy
+     * desync, we wipe each channel's rx_buf and write our own
+     * deterministic response.
+     *
+     * Trade-off: controller paks (rumble pak, controller pak) are
+     * effectively disabled in Frame Zero sessions — we always respond
+     * "no pak". Adding pak sync would need its own protocol; for
+     * SSB64 (the only Frame Zero target today) this isn't a feature
+     * loss. */
+    const int num_active_slots = active ? g_num_players : kFZMaxPlayers;
 
-    /* On the first JCMD_CONTROLLER_READ this frame, snapshot the local
-     * input that the input plugin already wrote to channel 0's rx
-     * buffer. Subsequent reads in the same frame use the cache. */
-    bool is_ctrl_read = (pif->channels[0].tx != nullptr &&
-                        pif->channels[0].tx_buf[0] == FZ_JCMD_CONTROLLER_READ &&
-                        pif->channels[0].rx_buf  != nullptr);
-
-    if (is_ctrl_read && !g_pif_synced_this_frame)
+    for (int i = 0; i < kNumControllerChannels; ++i)
     {
-        const uint8_t* rx = pif->channels[0].rx_buf;
-        uint32_t local = ((uint32_t)rx[0] << 24) |
-                         ((uint32_t)rx[1] << 16) |
-                         ((uint32_t)rx[2] <<  8) |
-                          (uint32_t)rx[3];
-        g_local_input_staged.store(local, std::memory_order_relaxed);
-        g_local_input_valid.store(true, std::memory_order_release);
-        g_pif_synced_this_frame = true;
-    }
-
-    /* Write synced inputs to all channels for every poll, matching
-     * Kaillera's pattern. JCMD_STATUS / JCMD_RESET force a stock
-     * controller response so the game detects all slots even before
-     * GekkoNet has produced any AdvanceEvents. */
-    for (int i = 0; i < g_num_players && i < kFZMaxPlayers; ++i)
-    {
-        if (pif->channels[i].tx == nullptr || pif->channels[i].rx == nullptr)
+        auto& ch = pif->channels[i];
+        if (ch.tx == nullptr || ch.rx == nullptr)
             continue;
 
-        *pif->channels[i].rx &= ~0xC0;
+        /* Clear NoResponse / DeviceMissing flags; preserve the rx
+         * count in the low 6 bits, which the CPU set up via
+         * setup_pif_channel and must be honoured. */
+        *ch.rx &= ~0xC0;
+        const uint8_t rx_count = *ch.rx & 0x3f;
 
-        const uint8_t cmd = pif->channels[i].tx_buf[0];
-        if (cmd == FZ_JCMD_STATUS || cmd == FZ_JCMD_RESET)
+        if (ch.rx_buf != nullptr && rx_count > 0)
         {
-            if (pif->channels[i].rx_buf != nullptr)
-            {
-                const uint16_t type = 0x0500;
-                pif->channels[i].rx_buf[0] = (uint8_t)(type & 0xFF);
-                pif->channels[i].rx_buf[1] = (uint8_t)(type >> 8);
-                pif->channels[i].rx_buf[2] = 0;
-            }
+            std::memset(ch.rx_buf, 0, rx_count);
         }
-        else if (cmd == FZ_JCMD_CONTROLLER_READ &&
-                 g_synced_have_data &&
-                 i < g_synced_count &&
-                 pif->channels[i].rx_buf != nullptr)
+
+        const uint8_t cmd = (ch.tx_buf != nullptr) ? ch.tx_buf[0] : 0xFF;
+
+        if (i < num_active_slots)
         {
-            uint8_t* rx = pif->channels[i].rx_buf;
-            const uint32_t v = g_synced_inputs[i];
-            rx[0] = (uint8_t)((v >> 24) & 0xFF);
-            rx[1] = (uint8_t)((v >> 16) & 0xFF);
-            rx[2] = (uint8_t)((v >>  8) & 0xFF);
-            rx[3] = (uint8_t)( v        & 0xFF);
+            /* Real player slot — respond as a standard controller
+             * with no pak inserted. */
+            if (cmd == FZ_JCMD_STATUS || cmd == FZ_JCMD_RESET)
+            {
+                if (ch.rx_buf != nullptr && rx_count >= 3)
+                {
+                    /* Controller type 0x0005, written low-byte-first
+                     * (matches game_controller.c JCMD_STATUS). */
+                    ch.rx_buf[0] = 0x05;
+                    ch.rx_buf[1] = 0x00;
+                    ch.rx_buf[2] = 0x00;  /* status: no pak */
+                }
+            }
+            else if (cmd == FZ_JCMD_CONTROLLER_READ)
+            {
+                if (active && g_synced_have_data &&
+                    i < g_synced_count &&
+                    ch.rx_buf != nullptr && rx_count >= 4)
+                {
+                    const uint32_t v = g_synced_inputs[i];
+                    ch.rx_buf[0] = (uint8_t)((v >> 24) & 0xFF);
+                    ch.rx_buf[1] = (uint8_t)((v >> 16) & 0xFF);
+                    ch.rx_buf[2] = (uint8_t)((v >>  8) & 0xFF);
+                    ch.rx_buf[3] = (uint8_t)( v        & 0xFF);
+                }
+                /* else: rx_buf stays zeroed (already memset above). */
+            }
+            /* Other commands (PAK_READ, PAK_WRITE, EEPROM_*) get a
+             * zero response — equivalent to "no pak", which matches
+             * the STATUS response and is symmetric across peers. */
+        }
+        else
+        {
+            /* Empty slot — set NoResponse so PIF/game treat it as
+             * unplugged regardless of what the input plugin reported.
+             * Both peers do this identically → byte-symmetric PIF
+             * state. */
+            *ch.rx |= 0x80;
         }
     }
 }
