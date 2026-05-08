@@ -379,14 +379,68 @@ static void fz_pump_one_frame(unsigned int current_frame)
         switch (ev->type)
         {
             case GekkoDesyncDetected:
-                std::snprintf(buf, sizeof(buf),
-                    "[FrameZero] DESYNC frame=%d remote_handle=%d local_chk=0x%08x remote_chk=0x%08x",
-                    ev->data.desynced.frame,
-                    ev->data.desynced.remote_handle,
-                    ev->data.desynced.local_checksum,
-                    ev->data.desynced.remote_checksum);
-                CoreAddCallbackMessage(CoreDebugMessageType::Error, buf);
+            {
+                /* Rate-limit the desync log. Most desyncs we hit in
+                 * practice are gameplay-irrelevant divergence in
+                 * unused RDRAM regions (allocator scratch, audio
+                 * buffer tail, etc.) — the visible game stays in
+                 * sync but the 16 MB savestate hash catches the
+                 * unused-but-non-deterministic bytes. Logging every
+                 * frame floods the log without adding diagnostic
+                 * value beyond "yes, divergence is happening". A
+                 * one-line periodic summary (every ~3s) preserves
+                 * the signal without the noise. Set
+                 * FRAME_ZERO_VERBOSE_DESYNC=1 to restore per-frame
+                 * logging when actually localising a determinism
+                 * bug. */
+                static int                                  s_desync_count = 0;
+                static int                                  s_desync_first_frame = 0;
+                static int                                  s_desync_last_frame  = 0;
+                static uint32_t                             s_desync_last_local  = 0;
+                static uint32_t                             s_desync_last_remote = 0;
+                static std::chrono::steady_clock::time_point s_desync_last_log{};
+                static int                                  s_desync_verbose = -1;
+                if (s_desync_verbose < 0)
+                {
+                    const char* v = std::getenv("FRAME_ZERO_VERBOSE_DESYNC");
+                    s_desync_verbose = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+                }
+
+                if (s_desync_verbose)
+                {
+                    std::snprintf(buf, sizeof(buf),
+                        "[FrameZero] DESYNC frame=%d remote_handle=%d local_chk=0x%08x remote_chk=0x%08x",
+                        ev->data.desynced.frame,
+                        ev->data.desynced.remote_handle,
+                        ev->data.desynced.local_checksum,
+                        ev->data.desynced.remote_checksum);
+                    CoreAddCallbackMessage(CoreDebugMessageType::Error, buf);
+                    break;
+                }
+
+                if (s_desync_count == 0)
+                {
+                    s_desync_first_frame = ev->data.desynced.frame;
+                    s_desync_last_log    = std::chrono::steady_clock::now();
+                }
+                ++s_desync_count;
+                s_desync_last_frame  = ev->data.desynced.frame;
+                s_desync_last_local  = ev->data.desynced.local_checksum;
+                s_desync_last_remote = ev->data.desynced.remote_checksum;
+
+                const auto now = std::chrono::steady_clock::now();
+                if (now - s_desync_last_log >= std::chrono::seconds(3))
+                {
+                    std::snprintf(buf, sizeof(buf),
+                        "[FrameZero] DESYNC ×%d frames=[%d..%d] latest local=0x%08x remote=0x%08x",
+                        s_desync_count, s_desync_first_frame, s_desync_last_frame,
+                        s_desync_last_local, s_desync_last_remote);
+                    CoreAddCallbackMessage(CoreDebugMessageType::Warning, buf);
+                    s_desync_count       = 0;
+                    s_desync_last_log    = now;
+                }
                 break;
+            }
             case GekkoPlayerSyncing:
                 std::snprintf(buf, sizeof(buf),
                     "[FrameZero] handshake handle=%d %u/%u",
