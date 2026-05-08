@@ -4,6 +4,7 @@
 #include <RMG-Core/N02Traversal.hpp>
 
 #include <QApplication>
+#include <QButtonGroup>
 #include <QElapsedTimer>
 #include <QFormLayout>
 #include <QFontMetrics>
@@ -13,6 +14,8 @@
 #include <QHostInfo>
 #include <QListWidgetItem>
 #include <QNetworkInterface>
+#include <QRadioButton>
+#include <QSignalBlocker>
 #include <QUdpSocket>
 #include <QVBoxLayout>
 
@@ -78,9 +81,32 @@ void FrameZeroNetplayDialog::setupUI()
     m_localPortSpin->setRange(1024, 65535);
     m_localPortSpin->setValue(7000);
 
-    m_localSlotCombo = new QComboBox(localBox);
-    m_localSlotCombo->addItem("Player 1", 0);
-    m_localSlotCombo->addItem("Player 2", 1);
+    // Mode picker — Host (slot 0 / P1) vs Join (slot 1 / P2). The
+    // player slot is no longer chosen manually; it falls out of the
+    // role you pick. This is what gets exported as
+    // FRAME_ZERO_ONLINE_LOCAL.
+    m_modeHostRadio = new QRadioButton("Host (wait for joiner)", localBox);
+    m_modeJoinRadio = new QRadioButton("Join (connect to peer)",  localBox);
+    m_modeHostRadio->setToolTip("You are Player 1. The other player connects to your address.");
+    m_modeJoinRadio->setToolTip("You are Player 2. Enter the host's address below.");
+
+    m_modeGroup = new QButtonGroup(this);
+    m_modeGroup->setExclusive(true);
+    m_modeGroup->addButton(m_modeHostRadio, static_cast<int>(Mode::Host));
+    m_modeGroup->addButton(m_modeJoinRadio, static_cast<int>(Mode::Join));
+    m_modeHostRadio->setChecked(true);
+
+    auto* modeRow    = new QWidget(localBox);
+    auto* modeLayout = new QHBoxLayout(modeRow);
+    modeLayout->setContentsMargins(0, 0, 0, 0);
+    modeLayout->setSpacing(12);
+    modeLayout->addWidget(m_modeHostRadio);
+    modeLayout->addWidget(m_modeJoinRadio);
+    modeLayout->addStretch();
+
+    m_modeHintLabel = new QLabel(localBox);
+    m_modeHintLabel->setWordWrap(true);
+    m_modeHintLabel->setTextFormat(Qt::RichText);
 
     m_inputDelaySpin = new QSpinBox(localBox);
     m_inputDelaySpin->setRange(0, 9);
@@ -104,7 +130,8 @@ void FrameZeroNetplayDialog::setupUI()
 
     localForm->addRow("Username:",       m_usernameEdit);
     localForm->addRow("Local UDP port:", m_localPortSpin);
-    localForm->addRow("Play as:",        m_localSlotCombo);
+    localForm->addRow("Mode:",           modeRow);
+    localForm->addRow("",                m_modeHintLabel);
     localForm->addRow("Input delay:",    m_inputDelaySpin);
     localForm->addRow("Handshake timeout:", m_timeoutSpin);
     localForm->addRow("Share with peer:", m_localAddrLabel);
@@ -170,23 +197,95 @@ void FrameZeroNetplayDialog::setupUI()
     connect(m_peerHistoryList, &QListWidget::itemDoubleClicked, this, &FrameZeroNetplayDialog::onPeerHistoryActivated);
     connect(m_localPortSpin, qOverload<int>(&QSpinBox::valueChanged),
             this, [this](int) { refreshLocalAddressLabel(); });
+    connect(m_modeHostRadio, &QRadioButton::toggled,
+            this, [this](bool) { onModeChanged(); });
+    connect(m_modeJoinRadio, &QRadioButton::toggled,
+            this, [this](bool) { onModeChanged(); });
 
     refreshLocalAddressLabel();
+    onModeChanged();
     resize(480, 460);
+}
+
+FrameZeroNetplayDialog::Mode FrameZeroNetplayDialog::currentMode() const
+{
+    return m_modeJoinRadio && m_modeJoinRadio->isChecked() ? Mode::Join : Mode::Host;
+}
+
+void FrameZeroNetplayDialog::setCurrentMode(Mode mode)
+{
+    if (mode == Mode::Join)
+    {
+        m_modeJoinRadio->setChecked(true);
+    }
+    else
+    {
+        m_modeHostRadio->setChecked(true);
+    }
+}
+
+void FrameZeroNetplayDialog::onModeChanged()
+{
+    if (m_modeHintLabel == nullptr) return;
+
+    /* Swap the spinner value based on which mode is now active. We
+     * snapshot the current spinner value into the *previous* mode's
+     * memory before reading the new mode's value back out. This way
+     * each mode keeps its own port preference even after the user
+     * toggles back and forth. */
+    if (m_localPortSpin != nullptr)
+    {
+        const int currentSpinnerValue = m_localPortSpin->value();
+        if (m_lastModeForPort == Mode::Host) m_hostPort = currentSpinnerValue;
+        else                                 m_joinPort = currentSpinnerValue;
+
+        const Mode now = currentMode();
+        const int newPort = (now == Mode::Host) ? m_hostPort : m_joinPort;
+        QSignalBlocker block(m_localPortSpin);
+        m_localPortSpin->setValue(newPort);
+        m_lastModeForPort = now;
+        refreshLocalAddressLabel();
+    }
+
+    if (currentMode() == Mode::Host)
+    {
+        m_modeHintLabel->setText(
+            "<i>Other player connects to your address. You are <b>Player 1</b>.</i>");
+    }
+    else
+    {
+        m_modeHintLabel->setText(
+            "<i>Enter the host's address below. You are <b>Player 2</b>.</i>");
+    }
 }
 
 void FrameZeroNetplayDialog::loadSettings()
 {
     const std::string username  = CoreSettingsGetStringValue(SettingsID::FrameZero_Username);
-    const int         localPort = CoreSettingsGetIntValue(SettingsID::FrameZero_LocalPort);
-    const int         localSlot = CoreSettingsGetIntValue(SettingsID::FrameZero_LocalSlot);
+    const int         hostPort  = CoreSettingsGetIntValue(SettingsID::FrameZero_LocalPort);
+    const int         joinPort  = CoreSettingsGetIntValue(SettingsID::FrameZero_LocalPort_Join);
+    const int         modeInt   = CoreSettingsGetIntValue(SettingsID::FrameZero_Mode);
     const int         inputDelay = CoreSettingsGetIntValue(SettingsID::FrameZero_InputDelay);
     const int         timeoutS  = CoreSettingsGetIntValue(SettingsID::FrameZero_TimeoutSeconds);
     const std::string lastPeer  = CoreSettingsGetStringValue(SettingsID::FrameZero_LastPeer);
 
     m_usernameEdit->setText(QString::fromStdString(username));
-    if (localPort >= 1024 && localPort <= 65535) m_localPortSpin->setValue(localPort);
-    if (localSlot == 0 || localSlot == 1) m_localSlotCombo->setCurrentIndex(localSlot);
+    if (hostPort >= 1024 && hostPort <= 65535) m_hostPort = hostPort;
+    if (joinPort >= 1024 && joinPort <= 65535) m_joinPort = joinPort;
+
+    /* Set mode first so onModeChanged's port-swap logic sees the right
+     * "previous" state when it copies-out the spinner value. We
+     * pre-load m_lastModeForPort to match the saved mode so the first
+     * onModeChanged after this point doesn't overwrite the wrong
+     * memory slot. */
+    const Mode savedMode = (modeInt == static_cast<int>(Mode::Join)) ? Mode::Join : Mode::Host;
+    m_lastModeForPort = savedMode;
+    {
+        QSignalBlocker block(m_localPortSpin);
+        m_localPortSpin->setValue(savedMode == Mode::Host ? m_hostPort : m_joinPort);
+    }
+    setCurrentMode(savedMode);
+
     if (inputDelay >= 0 && inputDelay <= 9) m_inputDelaySpin->setValue(inputDelay);
     if (timeoutS  >= 5 && timeoutS  <= 600) m_timeoutSpin->setValue(timeoutS);
     m_peerEdit->setText(QString::fromStdString(lastPeer));
@@ -208,12 +307,19 @@ void FrameZeroNetplayDialog::loadSettings()
 
 void FrameZeroNetplayDialog::saveSettings()
 {
+    /* Snapshot the current spinner value into the active mode's slot
+     * so the most recent edit is captured before we persist. */
+    if (currentMode() == Mode::Host) m_hostPort = m_localPortSpin->value();
+    else                             m_joinPort = m_localPortSpin->value();
+
     CoreSettingsSetValue(SettingsID::FrameZero_Username,
                          m_usernameEdit->text().toStdString());
     CoreSettingsSetValue(SettingsID::FrameZero_LocalPort,
-                         m_localPortSpin->value());
-    CoreSettingsSetValue(SettingsID::FrameZero_LocalSlot,
-                         m_localSlotCombo->currentIndex());
+                         m_hostPort);
+    CoreSettingsSetValue(SettingsID::FrameZero_LocalPort_Join,
+                         m_joinPort);
+    CoreSettingsSetValue(SettingsID::FrameZero_Mode,
+                         static_cast<int>(currentMode()));
     CoreSettingsSetValue(SettingsID::FrameZero_InputDelay,
                          m_inputDelaySpin->value());
     CoreSettingsSetValue(SettingsID::FrameZero_TimeoutSeconds,
@@ -526,9 +632,10 @@ void FrameZeroNetplayDialog::onConnect()
         return;
     }
 
-    // Snapshot the values for the caller.
+    // Snapshot the values for the caller. The slot is implicit:
+    // Host => 0 (Player 1), Join => 1 (Player 2).
     m_localPort    = m_localPortSpin->value();
-    m_localSlot    = m_localSlotCombo->currentIndex();
+    m_localSlot    = (currentMode() == Mode::Host) ? 0 : 1;
     m_timeoutSec   = m_timeoutSpin->value();
     m_peerResolved = resolved;
 

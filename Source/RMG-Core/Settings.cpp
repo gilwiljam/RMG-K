@@ -327,8 +327,11 @@ static l_Setting get_setting(SettingsID settingId)
     case SettingsID::FrameZero_LocalPort:
         setting = {SETTING_SECTION_FRAMEZERO, "LocalPort", 7000};
         break;
-    case SettingsID::FrameZero_LocalSlot:
-        setting = {SETTING_SECTION_FRAMEZERO, "LocalSlot", 0}; // 0=P1, 1=P2
+    case SettingsID::FrameZero_LocalPort_Join:
+        setting = {SETTING_SECTION_FRAMEZERO, "LocalPortJoin", 7001};
+        break;
+    case SettingsID::FrameZero_Mode:
+        setting = {SETTING_SECTION_FRAMEZERO, "Mode", 0}; // 0=Host (P1), 1=Join (P2)
         break;
     case SettingsID::FrameZero_InputDelay:
         setting = {SETTING_SECTION_FRAMEZERO, "InputDelay", 2}; // 0..9 GekkoNet local delay

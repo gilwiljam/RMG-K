@@ -4,10 +4,11 @@
 #include <QDialog>
 #include <QLineEdit>
 #include <QSpinBox>
-#include <QComboBox>
 #include <QPushButton>
 #include <QLabel>
 #include <QListWidget>
+#include <QRadioButton>
+#include <QButtonGroup>
 
 namespace UserInterface
 {
@@ -65,6 +66,7 @@ private slots:
     void onCancel();
     void onPeerHistoryActivated(QListWidgetItem* item);
     void onPeerTextChanged(const QString& text);
+    void onModeChanged();
 
 private:
     void setupUI();
@@ -72,6 +74,13 @@ private:
     void saveSettings();
     void appendPeerHistory(const QString& peer);
     QStringList loadPeerHistoryList() const;
+
+    // Mode helpers — slot 0 (Player 1) when hosting, slot 1 (Player 2)
+    // when joining. The Frame Zero handshake stays symmetric; only the
+    // role label and hint change.
+    enum class Mode { Host = 0, Join = 1 };
+    Mode currentMode() const;
+    void setCurrentMode(Mode mode);
 
     void setStatus(const QString& message, bool error);
     void refreshLocalAddressLabel();
@@ -86,7 +95,10 @@ private:
 
     QLineEdit*    m_usernameEdit    = nullptr;
     QSpinBox*     m_localPortSpin   = nullptr;
-    QComboBox*    m_localSlotCombo  = nullptr;
+    QRadioButton* m_modeHostRadio   = nullptr;
+    QRadioButton* m_modeJoinRadio   = nullptr;
+    QButtonGroup* m_modeGroup       = nullptr;
+    QLabel*       m_modeHintLabel   = nullptr;
     QSpinBox*     m_inputDelaySpin  = nullptr;
     QSpinBox*     m_timeoutSpin     = nullptr;
     QLabel*       m_localAddrLabel  = nullptr;
@@ -102,6 +114,15 @@ private:
     int     m_localSlot   = 0;
     int     m_timeoutSec  = 60;
     QString m_peerResolved; // "ip:port" after Connect succeeds
+
+    // Per-mode port memory. The spinner shows the value for the
+    // currently-selected mode; switching mode swaps to the other
+    // value. Defaults differ by 1 so two RMG-K instances on the same
+    // machine can both bind without the user having to think about
+    // it.
+    int     m_hostPort        = 7000;
+    int     m_joinPort        = 7001;
+    Mode    m_lastModeForPort = Mode::Host;
 };
 
 } // namespace Dialog

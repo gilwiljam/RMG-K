@@ -98,8 +98,11 @@ enum class SettingsID
 
     // Frame Zero Netplay Settings
     FrameZero_Username,
-    FrameZero_LocalPort,
-    FrameZero_LocalSlot,
+    FrameZero_LocalPort,        // Host-mode port (default 7000)
+    FrameZero_LocalPort_Join,   // Join-mode port (default 7001) — different
+                                // by default so two RMG-K instances on the
+                                // same machine can bind without colliding.
+    FrameZero_Mode,
     FrameZero_InputDelay,
     FrameZero_TimeoutSeconds,
     FrameZero_LastPeer,
