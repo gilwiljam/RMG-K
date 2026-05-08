@@ -96,6 +96,15 @@ enum class SettingsID
     Kaillera_PlayerColumnWidths,
     Kaillera_P2PLastGame,
 
+    // Frame Zero Netplay Settings
+    FrameZero_Username,
+    FrameZero_LocalPort,
+    FrameZero_LocalSlot,
+    FrameZero_TimeoutSeconds,
+    FrameZero_LastPeer,
+    FrameZero_PeerHistory,
+    FrameZero_DialogGeometry,
+
     // Core Plugin Settings
     Core_GFX_Plugin,
     Core_AUDIO_Plugin,

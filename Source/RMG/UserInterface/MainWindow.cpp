@@ -22,6 +22,7 @@
 #include "Dialog/Netplay/NetplaySessionBrowserDialog.hpp"
 #include "Dialog/Netplay/CreateNetplaySessionDialog.hpp"
 #include "Dialog/Netplay/NetplaySessionDialog.hpp"
+#include "Dialog/FrameZero/FrameZeroNetplayDialog.hpp"
 #endif // NETPLAY
 #if defined(NETPLAY) && defined(_WIN32)
 #include "KailleraUIBridge.hpp"
@@ -2749,121 +2750,15 @@ void MainWindow::on_Action_Netplay_CreateSession(void)
 void MainWindow::on_Action_Netplay_BrowseSessions(void)
 {
 #ifdef NETPLAY
-    // Initialize Kaillera if not already initialized
-    if (!CoreInitKaillera())
+    // Frame Zero (rollback) replaces the old Kaillera launcher. The
+    // dialog gathers a peer endpoint (IP:port for direct testing, or a
+    // connect code resolved via the N02 traversal server) and arms the
+    // FRAME_ZERO_ONLINE_* env vars; the existing tryFrameZeroConnect
+    // path drives the UDP handshake and emulation start.
+    Dialog::FrameZeroNetplayDialog dlg(this);
+    if (dlg.exec() == QDialog::Accepted && dlg.acceptedConnect())
     {
-        this->showErrorMessage("Kaillera Error", QString::fromStdString(CoreGetError()));
-        return;
-    }
-
-    // Set Kaillera app info (app name and game list)
-    std::string appName = "RMG-K " + CoreGetVersion();
-    // Build game list from ROM browser (null-terminated strings with double-null at end)
-    // Must use std::string directly to preserve embedded null characters
-    std::string gameList;
-    QMap<QString, CoreRomSettings> romData = this->ui_Widget_RomBrowser->GetModelData();
-
-    // Collect and sort game names alphabetically for Kaillera.
-    // Fallback to filename when GoodName is empty/invalid to avoid creating
-    // an empty first entry in the null-delimited list.
-    std::vector<std::string> goodNames;
-    for (auto it = romData.begin(); it != romData.end(); ++it)
-    {
-        std::string goodName = it.value().GoodName;
-        // Strip "(unknown rom)" suffix for better Kaillera compatibility
-        const std::string suffix = " (unknown rom)";
-        if (goodName.size() >= suffix.size() &&
-            goodName.compare(goodName.size() - suffix.size(), suffix.size(), suffix) == 0)
-        {
-            goodName = goodName.substr(0, goodName.size() - suffix.size());
-        }
-
-        QString displayName = QString::fromStdString(goodName).trimmed();
-        if (displayName.isEmpty())
-        {
-            QFileInfo fileInfo(it.key());
-            displayName = fileInfo.completeBaseName().trimmed();
-            if (displayName.isEmpty())
-            {
-                displayName = fileInfo.fileName().trimmed();
-            }
-        }
-
-        if (!displayName.isEmpty())
-        {
-            goodNames.push_back(displayName.toStdString());
-        }
-    }
-    std::sort(goodNames.begin(), goodNames.end(), [](const std::string& a, const std::string& b) {
-        return QString::fromStdString(a).compare(QString::fromStdString(b), Qt::CaseInsensitive) < 0;
-    });
-
-    for (const auto& name : goodNames)
-    {
-        gameList += name;
-        gameList += '\0';
-    }
-    gameList += '\0'; // Double null terminator
-    CoreSetKailleraAppInfo(appName, gameList);
-
-    // Create Kaillera session manager
-    if (this->kailleraSessionManager != nullptr)
-    {
-        delete this->kailleraSessionManager;
-    }
-    this->kailleraSessionManager = new KailleraSessionManager(this);
-
-    // Connect signals
-    connect(this->kailleraSessionManager, &KailleraSessionManager::gameStarted,
-            this, &MainWindow::on_Kaillera_GameStarted);
-    connect(this->kailleraSessionManager, &KailleraSessionManager::chatReceived,
-            this, &MainWindow::on_Kaillera_ChatReceived);
-#ifdef _WIN32
-    connect(&KailleraUIBridge::instance(), &KailleraUIBridge::kailleraGameChatReceived,
-            this, &MainWindow::on_Kaillera_ChatReceived);
-    connect(&KailleraUIBridge::instance(), &KailleraUIBridge::p2pChatReceived,
-            this, &MainWindow::on_Kaillera_ChatReceived);
-    connect(&KailleraUIBridge::instance(), &KailleraUIBridge::recordingFileClosed,
-            this, &MainWindow::on_Kaillera_RecordingFileClosed);
-#endif
-    connect(this->kailleraSessionManager, &KailleraSessionManager::playerDropped,
-            this, &MainWindow::on_Kaillera_PlayerDropped);
-    connect(this->kailleraSessionManager, &KailleraSessionManager::gameEnded,
-            this, &MainWindow::on_Kaillera_GameEnded);
-
-    // Disable buttons while Kaillera dialog is open
-    this->action_Netplay_BrowseSessions->setEnabled(false);
-    this->action_Netplay_Start->setEnabled(false);
-    this->action_System_StartRom->setEnabled(false);
-
-    // Show Kaillera's built-in server browser dialog
-    // This is a blocking call - user will select server, join/create game
-    // When they start a game, gameStarted signal will be emitted
-    // Dialog stays open until user closes it
-    this->kailleraSessionManager->showServerDialog();
-
-    // Dialog closed - clean up Kaillera session
-    // (emulation may still be running - user can manually stop it)
-    // Guard: closeEvent may have already cleaned up if the main window was closed
-    if (this->kailleraSessionManager != nullptr)
-    {
-#ifdef _WIN32
-        disconnect(&KailleraUIBridge::instance(), &KailleraUIBridge::kailleraGameChatReceived,
-                   this, &MainWindow::on_Kaillera_ChatReceived);
-        disconnect(&KailleraUIBridge::instance(), &KailleraUIBridge::p2pChatReceived,
-                   this, &MainWindow::on_Kaillera_ChatReceived);
-        disconnect(&KailleraUIBridge::instance(), &KailleraUIBridge::recordingFileClosed,
-                   this, &MainWindow::on_Kaillera_RecordingFileClosed);
-#endif
-        delete this->kailleraSessionManager;
-        this->kailleraSessionManager = nullptr;
-        CoreShutdownKaillera();
-
-        // Re-enable buttons and update UI
-        this->action_Netplay_BrowseSessions->setEnabled(true);
-        this->action_Netplay_Start->setEnabled(true);
-        this->action_System_StartRom->setEnabled(true);
-        this->updateUI(this->emulationThread->isRunning(), CoreIsEmulationPaused());
+        this->tryFrameZeroConnect();
     }
 #endif // NETPLAY
 }

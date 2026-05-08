@@ -73,6 +73,7 @@ static bool l_InputPluginSwitchRequested = false;
 #define SETTING_SECTION_INPUT       SETTING_SECTION_GUI  " - Input Plugin"
 #define SETTING_SECTION_GCA         SETTING_SECTION_GUI  " - GameCube Adapter Input Plugin"
 #define SETTING_SECTION_KAILLERA    SETTING_SECTION_GUI  " Kaillera"
+#define SETTING_SECTION_FRAMEZERO   SETTING_SECTION_GUI  " FrameZero"
 #define SETTING_SECTION_RSP         "Rsp-HLE"
 
 // retrieves l_Setting from settingId
@@ -318,6 +319,28 @@ static l_Setting get_setting(SettingsID settingId)
         break;
     case SettingsID::Kaillera_P2PLastGame:
         setting = {SETTING_SECTION_KAILLERA, "P2PLastGame", std::string("")};
+        break;
+
+    case SettingsID::FrameZero_Username:
+        setting = {SETTING_SECTION_FRAMEZERO, "Username", std::string("Player")};
+        break;
+    case SettingsID::FrameZero_LocalPort:
+        setting = {SETTING_SECTION_FRAMEZERO, "LocalPort", 7000};
+        break;
+    case SettingsID::FrameZero_LocalSlot:
+        setting = {SETTING_SECTION_FRAMEZERO, "LocalSlot", 0}; // 0=P1, 1=P2
+        break;
+    case SettingsID::FrameZero_TimeoutSeconds:
+        setting = {SETTING_SECTION_FRAMEZERO, "TimeoutSeconds", 60};
+        break;
+    case SettingsID::FrameZero_LastPeer:
+        setting = {SETTING_SECTION_FRAMEZERO, "LastPeer", std::string("")};
+        break;
+    case SettingsID::FrameZero_PeerHistory:
+        setting = {SETTING_SECTION_FRAMEZERO, "PeerHistory", std::string("")};
+        break;
+    case SettingsID::FrameZero_DialogGeometry:
+        setting = {SETTING_SECTION_FRAMEZERO, "DialogGeometry", std::string("")};
         break;
 
     case SettingsID::Core_GFX_Plugin:
