@@ -176,6 +176,11 @@ void FrameZeroNetplayDialog::setupUI()
 
     // ---- Buttons ----
     auto* buttonRow = new QHBoxLayout();
+    m_btnFindMatch = new QPushButton("Find Match", this);
+    m_btnFindMatch->setToolTip("Auto-pair with a second RMG-K instance on this machine — "
+                               "binds UDP 7000 if free (Host) or 7001 with peer 127.0.0.1:7000 "
+                               "(Join). One click on each instance.");
+    buttonRow->addWidget(m_btnFindMatch);
     buttonRow->addStretch();
     m_btnCancel  = new QPushButton("Cancel",  this);
     m_btnConnect = new QPushButton("Connect", this);
@@ -186,6 +191,7 @@ void FrameZeroNetplayDialog::setupUI()
 
     connect(m_btnConnect,    &QPushButton::clicked, this, &FrameZeroNetplayDialog::onConnect);
     connect(m_btnCancel,     &QPushButton::clicked, this, &FrameZeroNetplayDialog::onCancel);
+    connect(m_btnFindMatch,  &QPushButton::clicked, this, &FrameZeroNetplayDialog::onFindMatch);
     connect(m_btnLookup,     &QPushButton::clicked, this, &FrameZeroNetplayDialog::onLookupCode);
     connect(m_peerEdit,      &QLineEdit::textChanged, this, &FrameZeroNetplayDialog::onPeerTextChanged);
     connect(m_peerHistoryList, &QListWidget::itemActivated, this, &FrameZeroNetplayDialog::onPeerHistoryActivated);
@@ -609,6 +615,86 @@ void FrameZeroNetplayDialog::onLookupCode()
         setStatus(error, true);
         m_peerResolved.clear();
     }
+}
+
+void FrameZeroNetplayDialog::onFindMatch()
+{
+    /* Localhost two-instance auto-pair. Try to bind UDP 7000 — if it
+     * works, we're the first instance to claim it, so we play Host on
+     * 7000 with peer 127.0.0.1:7001. If 7000 is taken (the other
+     * instance got there first), we fall back to 7001 as Join with
+     * peer 127.0.0.1:7000.
+     *
+     * The probe binds momentarily and releases — there's a tiny race
+     * window before the FZ handshake binds for real, but for two
+     * processes on the same machine clicking ~simultaneously the
+     * resolution is deterministic enough.
+     *
+     * Internet matchmaking is a separate larger project — needs a
+     * queue server. This button intentionally targets local testing. */
+
+    constexpr quint16 kHostPort = 7000;
+    constexpr quint16 kJoinPort = 7001;
+
+    auto canBind = [](quint16 port) {
+        QUdpSocket s;
+        const bool ok = s.bind(QHostAddress::LocalHost, port);
+        s.close();
+        return ok;
+    };
+
+    int   localPort = 0;
+    Mode  mode      = Mode::Host;
+    QString peer;
+
+    if (canBind(kHostPort))
+    {
+        localPort = kHostPort;
+        mode      = Mode::Host;
+        peer      = "127.0.0.1:" + QString::number(kJoinPort);
+    }
+    else if (canBind(kJoinPort))
+    {
+        localPort = kJoinPort;
+        mode      = Mode::Join;
+        peer      = "127.0.0.1:" + QString::number(kHostPort);
+    }
+    else
+    {
+        setStatus("Both 7000 and 7001 are in use. Stop other RMG-K instances "
+                  "(or other programs holding those ports) and try again.", true);
+        return;
+    }
+
+    /* Sync the dialog's visible state to what we're about to do, so
+     * the saved settings reflect the matched configuration on next
+     * launch. Signals are blocked on the spinner so onModeChanged
+     * doesn't fight us with its per-mode port memory. */
+    {
+        QSignalBlocker block(m_localPortSpin);
+        m_localPortSpin->setValue(localPort);
+    }
+    setCurrentMode(mode);
+    m_peerEdit->setText(peer);
+
+    /* Snapshot the values, set env vars, save, accept — same shape as
+     * onConnect's tail, just with the auto-derived values. */
+    m_localPort    = localPort;
+    m_localSlot    = (mode == Mode::Host) ? 0 : 1;
+    m_timeoutSec   = m_timeoutSpin->value();
+    m_peerResolved = peer;
+
+    setEnvVar("FRAME_ZERO_ONLINE",         "1");
+    setEnvVar("FRAME_ZERO_ONLINE_PORT",    std::to_string(m_localPort));
+    setEnvVar("FRAME_ZERO_ONLINE_PEERS",   peer.toStdString());
+    setEnvVar("FRAME_ZERO_ONLINE_LOCAL",   std::to_string(m_localSlot));
+    setEnvVar("FRAME_ZERO_ONLINE_TIMEOUT", std::to_string(m_timeoutSec));
+
+    appendPeerHistory(peer);
+    saveSettings();
+
+    m_accepted = true;
+    accept();
 }
 
 void FrameZeroNetplayDialog::onConnect()

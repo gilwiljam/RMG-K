@@ -64,6 +64,7 @@ private slots:
     void onLookupCode();
     void onConnect();
     void onCancel();
+    void onFindMatch();
     void onPeerHistoryActivated(QListWidgetItem* item);
     void onPeerTextChanged(const QString& text);
     void onModeChanged();
@@ -104,6 +105,7 @@ private:
     QLineEdit*    m_peerEdit        = nullptr;
     QListWidget*  m_peerHistoryList = nullptr;
     QPushButton*  m_btnLookup       = nullptr;
+    QPushButton*  m_btnFindMatch    = nullptr;
     QPushButton*  m_btnConnect      = nullptr;
     QPushButton*  m_btnCancel       = nullptr;
     QLabel*       m_statusLabel     = nullptr;
