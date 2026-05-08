@@ -99,4 +99,17 @@ CORE_EXPORT CoreFrameZero::SessionMode CoreGetFrameZeroSessionMode(void);
 // Frame Zero session starts.
 CORE_EXPORT int CoreFrameZeroModifyPlayValues(void* values, int size, int num_players);
 
+// Frame-advantage exposure (GGPO-article concept #1).
+//
+// GekkoNet tracks the local clock skew vs each remote peer via the
+// frame_advantage field exchanged on input ACK. gekko_frames_ahead()
+// returns the average across remotes — positive means we're running
+// ahead of the peer, negative means we're behind. The example
+// integrations slow the local frame pacing by ~1.6 % when the value
+// exceeds 0.5 to bring the two sides back into ±1 frame.
+//
+// Returns 0.0 when no session is active. Cheap to call; reads a single
+// float maintained by GekkoNet.
+CORE_EXPORT float CoreGetFrameZeroFramesAhead(void);
+
 #endif // CORE_FRAMEZERO_HPP

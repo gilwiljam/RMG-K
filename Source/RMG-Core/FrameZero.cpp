@@ -603,6 +603,29 @@ static void fz_pump_one_frame(unsigned int current_frame)
     }
     (void)current_frame;
 
+    /* Frame-advantage telemetry. Logs every ~5 s when online and the
+     * skew exceeds ±0.5 frames — i.e. in the regime where GekkoNet's
+     * own time-sync would tell the example integration to slow down.
+     * Silent when both peers are pacing in lock-step (the common
+     * case), noisy enough to surface a runaway-host condition before
+     * users notice it as input lag. Online sessions only — stress and
+     * spectator modes use different pacing. */
+    if (g_mode == CoreFrameZero::SessionMode::Online &&
+        n_advance > 0 &&
+        (g_pump_call_count % 300) == 0)
+    {
+        const float ahead = gekko_frames_ahead(g_session);
+        if (ahead > 0.5f || ahead < -0.5f)
+        {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                "[FrameZero pacing] frame=%d frames_ahead=%+.2f (%s)",
+                last_adv_frame, ahead,
+                ahead > 0.0f ? "local is ahead" : "local is behind");
+            CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
+        }
+    }
+
     /* Trailing rollback bookkeeping for the no-advance-event case.
      * AdvanceEvents already set the flag inline before resuming, so
      * this only matters for Load-only emissions (rare) or no-event
@@ -1046,4 +1069,14 @@ int CoreFrameZeroModifyPlayValues(void* /*values*/, int /*size*/, int /*num_play
      * legacy call sites compile; it never executes during a Frame
      * Zero session. */
     return -1;
+}
+
+float CoreGetFrameZeroFramesAhead(void)
+{
+#ifdef FRAME_ZERO
+    if (g_session == nullptr) return 0.0f;
+    return gekko_frames_ahead(g_session);
+#else
+    return 0.0f;
+#endif
 }
