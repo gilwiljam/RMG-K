@@ -276,6 +276,7 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
     void on_Action_Netplay_CreateSession(void);
     void on_Action_Netplay_BrowseSessions(void);
     void on_Action_Netplay_ViewSession(void);
+    void on_Action_FrameZero_SyncTest(void);
 
 #ifdef NETPLAY
     void on_Kaillera_GameStarted(QString gameName, int playerNum, int totalPlayers);

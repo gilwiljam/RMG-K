@@ -53,6 +53,7 @@
 #include <QStyleFactory>
 #include <QActionGroup> 
 #include <QFileDialog>
+#include <QInputDialog>
 #include <QFileInfo>
 #include <QMessageBox>
 #include <QMimeData>
@@ -1712,6 +1713,7 @@ void MainWindow::connectActionSignals(void)
     connect(this->action_View_Search, &QAction::triggered, this, &MainWindow::on_Action_View_Search);
 
     connect(this->action_Netplay_BrowseSessions, &QAction::triggered, this, &MainWindow::on_Action_Netplay_BrowseSessions);
+    connect(this->action_FrameZero_SyncTest, &QAction::triggered, this, &MainWindow::on_Action_FrameZero_SyncTest);
 
     connect(this->action_Help_Github, &QAction::triggered, this, &MainWindow::on_Action_Help_Github);
     connect(this->action_Help_About, &QAction::triggered, this, &MainWindow::on_Action_Help_About);
@@ -2761,6 +2763,52 @@ void MainWindow::on_Action_Netplay_BrowseSessions(void)
         this->tryFrameZeroConnect();
     }
 #endif // NETPLAY
+}
+
+void MainWindow::on_Action_FrameZero_SyncTest(void)
+{
+    // Local determinism stress test (Cannon's "SyncTest mode"). Boots
+    // SSB64 NTSC-U with no peer, opens a local 2-actor GekkoNet
+    // session via FRAME_ZERO_STRESS=<frames>, and lets the existing
+    // StressArm() / StressTick() harness drive save/load/advance for
+    // the configured frame count. Any DESYNC events surface in the
+    // log; if the run completes clean, the snapshot path is byte-
+    // deterministic for that frame count.
+
+    if (this->emulationThread != nullptr && this->emulationThread->isRunning())
+    {
+        this->showErrorMessage("Sync test",
+            "Stop the running game before starting a sync test.");
+        return;
+    }
+
+    bool ok = false;
+    const int frames = QInputDialog::getInt(this, "Frame Zero — Sync test",
+        "How many frames to run? (10,000 ≈ 3 minutes at 60 fps)",
+        /*value*/ 10000, /*min*/ 60, /*max*/ 600000, /*step*/ 1000, &ok);
+    if (!ok) return;
+
+    const QString internalName = "SMASH BROTHERS";
+    const QString romFile = this->ui_Widget_RomBrowser->FindRomByInternalName(internalName);
+    if (romFile.isEmpty())
+    {
+        this->showErrorMessage("Sync test",
+            "The sync test requires a ROM with cartridge internal name \"" + internalName +
+            "\" in your ROM browser. Add SSB64 NTSC-U and refresh the list.");
+        return;
+    }
+
+    // Belt-and-braces: the stress harness skips when FRAME_ZERO_ONLINE
+    // is set (online wins). Clear it so we're not running both.
+#ifdef _WIN32
+    _putenv_s("FRAME_ZERO_ONLINE", "");
+    _putenv_s("FRAME_ZERO_STRESS", std::to_string(frames).c_str());
+#else
+    unsetenv("FRAME_ZERO_ONLINE");
+    setenv("FRAME_ZERO_STRESS", std::to_string(frames).c_str(), 1);
+#endif
+
+    this->launchEmulationThread(romFile, "", false, -1, false);
 }
 
 void MainWindow::on_Action_Netplay_ViewSession(void)
