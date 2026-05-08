@@ -2757,6 +2757,19 @@ void MainWindow::on_Action_Netplay_BrowseSessions(void)
     // connect code resolved via the N02 traversal server) and arms the
     // FRAME_ZERO_ONLINE_* env vars; the existing tryFrameZeroConnect
     // path drives the UDP handshake and emulation start.
+
+    // Bail early if the SSB64 NTSC-U ROM isn't in the browser — saves
+    // the user filling out the dialog only to hit the same check inside
+    // tryFrameZeroConnect after they click Connect.
+    const QString internalName = "SMASH BROTHERS";
+    if (this->ui_Widget_RomBrowser->FindRomByInternalName(internalName).isEmpty())
+    {
+        this->showErrorMessage("Frame Zero",
+            "Frame Zero requires a ROM with cartridge internal name \"" + internalName +
+            "\" in your ROM browser. Add SSB64 NTSC-U and refresh the list.");
+        return;
+    }
+
     Dialog::FrameZeroNetplayDialog dlg(this);
     if (dlg.exec() == QDialog::Accepted && dlg.acceptedConnect())
     {
