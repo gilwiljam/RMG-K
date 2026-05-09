@@ -99,5 +99,8 @@ core_set_frame_zero_speed_adjust;
 core_get_frame_zero_speed_adjust;
 savestates_get_state_size;
 savestates_save_to_buffer;
+savestates_save_to_buffer_inplace;
 savestates_load_from_buffer;
+savestates_get_tlb_skip_stats;
+savestates_reset_tlb_skip_stats;
 local: *; };

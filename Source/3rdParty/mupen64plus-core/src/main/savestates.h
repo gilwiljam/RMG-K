@@ -65,10 +65,25 @@ EXPORT size_t CALL savestates_get_state_size(void);
  * Returns 1 on success, 0 on failure. */
 EXPORT int CALL savestates_save_to_buffer(uint8_t** out_buf, size_t* out_len);
 
+/* Captures full m64p savestate directly into a caller-provided buffer.
+ * Skips the internal malloc/memset/free that savestates_save_to_buffer
+ * does — useful for hot-path rollback callers that already have a
+ * persistent destination buffer. dst_cap must be >=
+ * savestates_get_state_size(). On success *out_len holds bytes written.
+ * Returns 1 on success, 0 if dst_cap is too small or save failed. */
+EXPORT int CALL savestates_save_to_buffer_inplace(uint8_t* dst, size_t dst_cap, size_t* out_len);
+
 /* Applies a savestate previously produced by savestates_save_to_buffer.
  * Skips MD5 check (caller is responsible for ensuring same ROM).
  * Returns 1 on success, 0 on failure. */
 EXPORT int CALL savestates_load_from_buffer(const uint8_t* buf, size_t len);
+
+/* TLB LUT skip-on-load telemetry. Counts buffer-mode loads where the 8 MB
+ * LUT memcpy was skipped (hits) vs. where TLB entries differed and the
+ * memcpy ran (misses). Read these from the rollback budget logger to
+ * confirm the optimization is firing. Pointers may be NULL. */
+EXPORT void CALL savestates_get_tlb_skip_stats(uint64_t* out_hits, uint64_t* out_misses);
+EXPORT void CALL savestates_reset_tlb_skip_stats(void);
 
 void savestates_select_slot(unsigned int s);
 unsigned int savestates_get_slot(void);

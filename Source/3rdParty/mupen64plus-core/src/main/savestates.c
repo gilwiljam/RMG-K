@@ -78,6 +78,13 @@ static const unsigned char pj64_magic[4] = { 0xC8, 0xA6, 0xD8, 0x23 };
 
 static savestates_job job = savestates_job_nothing;
 static savestates_type type = savestates_type_unknown;
+
+/* TLB LUT skip stats. Buffer-mode load only. Hits = entries unchanged so
+ * the 8 MB LUT memcpy was skipped. Misses = entries differed and we did
+ * the memcpy. Reset by savestates_reset_tlb_skip_stats(); read by
+ * savestates_get_tlb_skip_stats(). */
+static uint64_t s_tlb_lut_skip_hits = 0;
+static uint64_t s_tlb_lut_skip_misses = 0;
 static char *fname = NULL;
 
 static unsigned int slot = 0;
@@ -224,6 +231,20 @@ static int savestates_load_m64p(struct device* dev, char *filepath,
     unsigned char data_0001_0200[4096]; // 4k for extra state from v1.2
     int buffer_mode = (in_buf != NULL);
     int owns_savestate_data = 0;
+
+    /* TLB LUT skip-on-load (rollback fast path).
+     * The 0x100000-entry LUT_r/LUT_w arrays (4 MB each, 8 MB total) are
+     * a deterministic projection of the 32 tlb.entries that follow them
+     * in the savestate. If the entries are byte-identical to what's
+     * already loaded, the existing LUTs are guaranteed valid and the
+     * 8 MB memcpy can be skipped entirely. We snapshot the current
+     * entries, defer the LUT copy (saving source pointers), parse
+     * everything else including the new entries, then memcmp and
+     * only memcpy if they differ. */
+    unsigned char *deferred_lut_r_src = NULL;
+    unsigned char *deferred_lut_w_src = NULL;
+    struct tlb_entry old_tlb_entries[32];
+    int tlb_lut_skipped = 0;
 
     uint32_t* cp0_regs = r4300_cp0_regs(&dev->r4300.cp0);
 
@@ -540,8 +561,22 @@ static int savestates_load_m64p(struct device* dev, char *filepath,
     /* by default, reset flashram state here and load it later if available */
     poweron_flashram(&dev->cart.flashram);
 
-    COPYARRAY(dev->r4300.cp0.tlb.LUT_r, curr, uint32_t, 0x100000);
-    COPYARRAY(dev->r4300.cp0.tlb.LUT_w, curr, uint32_t, 0x100000);
+    if (buffer_mode)
+    {
+        /* Defer the 8 MB LUT copy. We snapshot current entries, then
+         * skip past the LUT region — we'll either memcpy or skip after
+         * we've seen the new entries. */
+        memcpy(old_tlb_entries, dev->r4300.cp0.tlb.entries, sizeof(old_tlb_entries));
+        deferred_lut_r_src = curr;
+        curr += 0x100000 * sizeof(uint32_t);
+        deferred_lut_w_src = curr;
+        curr += 0x100000 * sizeof(uint32_t);
+    }
+    else
+    {
+        COPYARRAY(dev->r4300.cp0.tlb.LUT_r, curr, uint32_t, 0x100000);
+        COPYARRAY(dev->r4300.cp0.tlb.LUT_w, curr, uint32_t, 0x100000);
+    }
 
     *r4300_llbit(&dev->r4300) = GETDATA(curr, uint32_t);
     COPYARRAY(r4300_regs(&dev->r4300), curr, int64_t, 32);
@@ -581,6 +616,23 @@ static int savestates_load_m64p(struct device* dev, char *filepath,
         dev->r4300.cp0.tlb.entries[i].start_odd = GETDATA(curr, uint32_t);
         dev->r4300.cp0.tlb.entries[i].end_odd = GETDATA(curr, uint32_t);
         dev->r4300.cp0.tlb.entries[i].phys_odd = GETDATA(curr, uint32_t);
+    }
+
+    /* Resolve the deferred LUT copy from earlier. Skip if entries match. */
+    if (buffer_mode)
+    {
+        if (memcmp(old_tlb_entries, dev->r4300.cp0.tlb.entries, sizeof(old_tlb_entries)) == 0)
+        {
+            tlb_lut_skipped = 1;
+            s_tlb_lut_skip_hits++;
+        }
+        else
+        {
+            memcpy(dev->r4300.cp0.tlb.LUT_r, deferred_lut_r_src, 0x100000 * sizeof(uint32_t));
+            memcpy(dev->r4300.cp0.tlb.LUT_w, deferred_lut_w_src, 0x100000 * sizeof(uint32_t));
+            s_tlb_lut_skip_misses++;
+        }
+        (void)tlb_lut_skipped;
     }
 
     savestates_load_set_pc(&dev->r4300, GETDATA(curr, uint32_t));
@@ -1666,7 +1718,15 @@ static void savestates_save_m64p_work(struct work_struct *work)
  * When out_save is non-NULL: builds the save state into a savestate_work struct
  *   and returns it via *out_save (filepath ignored). Caller owns *out_save and
  *   must free save->data and save itself when done. Used by Frame Zero rollback. */
-static int savestates_save_m64p(const struct device* dev, char *filepath, struct savestate_work **out_save)
+/* preallocated_data, when non-NULL, is a caller-provided buffer of size
+ * preallocated_cap that will be used as save->data instead of an internal
+ * malloc. Used by Frame Zero's in-place save path to skip a 16 MB malloc +
+ * memset + memcpy per frame. The caller retains ownership of the buffer
+ * and must NOT pass it back via free(); the save struct will not free it
+ * when destroyed. Only meaningful when out_save is non-NULL (buffer mode);
+ * the file-write path always allocates internally. */
+static int savestates_save_m64p(const struct device* dev, char *filepath, struct savestate_work **out_save,
+                                char* preallocated_data, size_t preallocated_cap)
 {
     unsigned char outbuf[4];
     int i;
@@ -1706,17 +1766,45 @@ static int savestates_save_m64p(const struct device* dev, char *filepath, struct
 
     // Allocate memory for the save state data
     save->size = 16788288 + sizeof(queue) + 4 + 4096 + rsp_section_size + 4096;
-    save->data = curr = malloc(save->size);
-    if (save->data == NULL)
+    int data_was_preallocated = 0;
+    if (preallocated_data != NULL && out_save != NULL)
     {
-        free(save->filepath);
-        free(save);
-        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to save state.");
-        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
-        return 0;
+        if (preallocated_cap < save->size)
+        {
+            free(save->filepath);
+            free(save);
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Save state buffer too small.");
+            StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
+            return 0;
+        }
+        save->data = curr = preallocated_data;
+        data_was_preallocated = 1;
+    }
+    else
+    {
+        save->data = curr = malloc(save->size);
+        if (save->data == NULL)
+        {
+            free(save->filepath);
+            free(save);
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to save state.");
+            StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
+            return 0;
+        }
     }
 
-    memset(save->data, 0, save->size);
+    /* Blanket-zero the buffer on the malloc'd path. On the preallocated
+     * (rollback) path we skip it: every byte the load actually reads is
+     * explicitly written by the save below, and the few `curr += N`
+     * gaps (padding from old format versions, flashram-removed slot,
+     * disk-not-present region) are skipped on load too — their bytes
+     * are never observed. The blanket memset of ~16.8 MB costs ~1 ms
+     * per save and is pure defensive cruft on the in-place rollback
+     * path. */
+    if (!data_was_preallocated)
+    {
+        memset(save->data, 0, save->size);
+    }
 
     // Write the save state data to memory
     PUTARRAY(savestate_magic, curr, unsigned char, 8);
@@ -2408,17 +2496,28 @@ static int savestates_save_pj64_unc(const struct device* dev, char *filepath)
 
 EXPORT size_t CALL savestates_get_state_size(void)
 {
-    /* Standard layout: 16,788,288 + queue (1024) + 4 + 4096 = 16,793,412.
+    /* Returns the ALLOCATED buffer size that savestates_save_m64p
+     * needs (matches the malloc'd size in that function). Slightly
+     * larger than the actual written byte count — the trailing 4096
+     * is unwritten padding the malloc path includes for safety, and
+     * the in-place save path enforces it as the minimum buffer
+     * capacity.
+     *
+     * Layout:
+     *   16,788,288    body (header + all the PUTDATA fields)
+     *   +    1,024    eventqueue
+     *   +        4    using_tlb
+     *   +    4,096    data_0001_0200 region (ai.fifo, cp0.last_addr, RTC, etc.)
+     *   +     ...     RSP1 trailer (8 + rsp_state_size, when HLE is active)
+     *   +    4,096    trailing padding
+     *
      * v2.1 fields (ai.fifo addresses + samples_format_changed) and v2.2
      * field (cp0.last_addr) live INSIDE the 4096-byte data_0001_0200
-     * region, so they're already counted — do NOT add them again.
-     * Plus optional Frame Zero RSP plugin extension (magic+len+payload). */
+     * region, so they're already counted — do NOT add them again. */
     size_t base = 16788288 + 1024 + 4 + 4096;
-    if (rsp.getStateSize != NULL) {
-        unsigned int psize = rsp.getStateSize();
-        if (psize > 0)
-            base += 8 + psize;
-    }
+    unsigned int rsp_state_size = (rsp.getStateSize != NULL) ? rsp.getStateSize() : 0;
+    size_t rsp_section_size = (rsp_state_size > 0) ? (rsp_state_size + 8) : 0;
+    base += rsp_section_size + 4096;
     return base;
 }
 
@@ -2429,7 +2528,7 @@ EXPORT int CALL savestates_save_to_buffer(uint8_t** out_buf, size_t* out_len)
     if (out_buf == NULL || out_len == NULL)
         return 0;
 
-    if (!savestates_save_m64p(&g_dev, NULL, &save) || save == NULL)
+    if (!savestates_save_m64p(&g_dev, NULL, &save, NULL, 0) || save == NULL)
         return 0;
 
     *out_buf = (uint8_t*)save->data;
@@ -2440,11 +2539,50 @@ EXPORT int CALL savestates_save_to_buffer(uint8_t** out_buf, size_t* out_len)
     return 1;
 }
 
+/* Frame Zero in-place save. Writes the savestate directly into the
+ * caller-provided buffer, skipping the 16 MB malloc + memset + free
+ * cycle (and the subsequent memcpy from m64p's malloc'd buffer to the
+ * caller's buffer that the regular save_to_buffer requires). The
+ * caller is responsible for ensuring dst is large enough — query
+ * savestates_get_state_size() first.
+ *
+ * Returns 1 on success with *out_len set to the number of bytes
+ * written. Returns 0 on failure (buffer too small, RSP plugin
+ * mid-state, etc.) and *out_len untouched. */
+EXPORT int CALL savestates_save_to_buffer_inplace(uint8_t* dst, size_t dst_cap, size_t* out_len)
+{
+    struct savestate_work* save = NULL;
+
+    if (dst == NULL || dst_cap == 0 || out_len == NULL)
+        return 0;
+
+    if (!savestates_save_m64p(&g_dev, NULL, &save, (char*)dst, dst_cap) || save == NULL)
+        return 0;
+
+    *out_len = save->size;
+    /* save->data points at the caller's buffer — do NOT free it. */
+    free(save->filepath); /* should be NULL in buffer mode but be defensive */
+    free(save);
+    return 1;
+}
+
 EXPORT int CALL savestates_load_from_buffer(const uint8_t* buf, size_t len)
 {
     if (buf == NULL || len == 0)
         return 0;
     return savestates_load_m64p(&g_dev, NULL, buf, len);
+}
+
+EXPORT void CALL savestates_get_tlb_skip_stats(uint64_t* out_hits, uint64_t* out_misses)
+{
+    if (out_hits != NULL)   *out_hits   = s_tlb_lut_skip_hits;
+    if (out_misses != NULL) *out_misses = s_tlb_lut_skip_misses;
+}
+
+EXPORT void CALL savestates_reset_tlb_skip_stats(void)
+{
+    s_tlb_lut_skip_hits = 0;
+    s_tlb_lut_skip_misses = 0;
 }
 
 int savestates_save(void)
@@ -2470,7 +2608,7 @@ int savestates_save(void)
     {
         switch (type)
         {
-            case savestates_type_m64p: ret = savestates_save_m64p(dev, filepath, NULL); break;
+            case savestates_type_m64p: ret = savestates_save_m64p(dev, filepath, NULL, NULL, 0); break;
             case savestates_type_pj64_zip: ret = savestates_save_pj64_zip(dev, filepath); break;
             case savestates_type_pj64_unc: ret = savestates_save_pj64_unc(dev, filepath); break;
             default: ret = 0; StateChanged(M64CORE_STATE_SAVECOMPLETE, ret); break;
