@@ -17,7 +17,6 @@
 #include "Netplay.hpp"
 #include "Kaillera.hpp"
 #include "FrameZero.hpp"
-#include "FrameZeroIPC.hpp"
 #include "Plugins.hpp"
 #include "Cheats.hpp"
 #include "Callback.hpp"
@@ -1236,11 +1235,6 @@ static void FrameCallback(unsigned int frameIndex)
 
     // Frame Zero Phase 4 online session (no-op unless FRAME_ZERO_ONLINE=1)
     OnlineTick();
-
-    // Frame Zero in-game IPC poll. No-op unless mupen-core exports are
-    // resolved (CoreFrameZeroIPCInit was called) and the magic word is
-    // non-zero. Cheap when idle: one RDRAM read + branch.
-    CoreFrameZeroIPCPoll();
 }
 
 // Kaillera PIF sync callback (called from mupen64plus-core after netplay sync)
@@ -1703,55 +1697,6 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
 
         // Frame Zero Phase 4 online session (no-op unless FRAME_ZERO_ONLINE=1).
         OnlineArm();
-
-        // Frame Zero in-game IPC channel — resolves the mupen-core
-        // RDRAM read/write exports so FrameCallback's per-VI poll can
-        // observe commands written by patched ROM code. Idempotent.
-        CoreFrameZeroIPCInit();
-        CoreFrameZeroIPCSetHandler([](uint32_t cmd, uint32_t cookie) {
-            /* Phase 5 stage 3 default handler: log + write ack to the
-             * result word so the patched game side can observe that
-             * the emulator received and processed the command.
-             *
-             * Wiring to the actual Frame Zero connect overlay is the
-             * stage-3b deliverable. For now this is enough to prove
-             * that the in-game OPTION → emulator IPC path works
-             * end-to-end via a vanilla mode-select dispatch rewrite. */
-            char buf[160];
-            switch (cmd)
-            {
-                case CoreFrameZero::IPC_OPEN_OVERLAY:
-                    std::snprintf(buf, sizeof(buf),
-                        "[FrameZero IPC] VS ONLINE selected — overlay/connect TBD (cookie=0x%02X)",
-                        (unsigned)cookie);
-                    break;
-                case CoreFrameZero::IPC_TRIGGER_HANDSHAKE:
-                    std::snprintf(buf, sizeof(buf),
-                        "[FrameZero IPC] handshake requested (cookie=0x%02X)",
-                        (unsigned)cookie);
-                    break;
-                case CoreFrameZero::IPC_END_SESSION:
-                    std::snprintf(buf, sizeof(buf),
-                        "[FrameZero IPC] end-session requested (cookie=0x%02X)",
-                        (unsigned)cookie);
-                    break;
-                case CoreFrameZero::IPC_PING:
-                    std::snprintf(buf, sizeof(buf),
-                        "[FrameZero IPC] ping cookie=0x%02X",
-                        (unsigned)cookie);
-                    break;
-                default:
-                    std::snprintf(buf, sizeof(buf),
-                        "[FrameZero IPC] unrecognized cmd=0x%06X cookie=0x%02X",
-                        (unsigned)cmd, (unsigned)cookie);
-                    break;
-            }
-            CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
-
-            /* Ack code 0x01 (= "received and acknowledged") in the
-             * result word. Game can poll for this if needed. */
-            CoreFrameZeroIPCWriteWord(CoreFrameZero::kIPCResultAddr, 0x00000001);
-        });
 
 #ifdef NETPLAY
         // Reset Kaillera sync state to prevent stale cache from previous sessions

@@ -41,7 +41,6 @@ set(RMG_CORE_SOURCES
     Kaillera.cpp
     FrameZero.cpp
     FrameZeroConnect.cpp
-    FrameZeroIPC.cpp
     FrameZeroNetShim.cpp
     FrameZeroState.cpp
     N02Traversal.cpp
