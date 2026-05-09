@@ -1209,6 +1209,7 @@ static void apply_speed_limiter(void)
     static int resetOnce = 0;
     static int lastSpeedFactor = 100;
     static uint64_t StartFPSTime = 0;
+    static uint64_t LastFrameExit = 0;
     static const double defaultSpeedFactor = 100.0;
     uint64_t CurrentFPSTime;
 
@@ -1219,10 +1220,42 @@ static void apply_speed_limiter(void)
     if (g_RollbackMode)
     {
         resetOnce = 0;
+        LastFrameExit = 0;
         return;
     }
 
     CurrentFPSTime = SDL_GetTicks();
+
+    /* Frame Zero pump-driven mode: enforce a hard per-frame minimum so
+     * the local sim never runs *faster* than 60 Hz, even when the
+     * cumulative-deficit logic would otherwise allow catch-up speed-up.
+     * In rollback netcode, speeding up the behind-peer feels terrible
+     * (audio pitches up, motion accelerates briefly). Slow-down recovery
+     * is supposed to come from the *peer's* frame-advantage brake, not
+     * from us going faster. This branch caps the local sim at 60 Hz max
+     * and short-circuits the cumulative tracking. */
+    if (l_pump_driven && l_MainSpeedLimit)
+    {
+        const double VILimitMs = 1000.0 / g_dev.vi.expected_refresh_rate;
+        const double SpeedFactorMul = defaultSpeedFactor / l_SpeedFactor;
+        const double AdjustedLimitMs = VILimitMs * SpeedFactorMul * g_FrameZero_SpeedAdjust;
+
+        if (LastFrameExit != 0)
+        {
+            const double elapsed = (double)(CurrentFPSTime - LastFrameExit);
+            double sleepTime = AdjustedLimitMs - elapsed;
+            if (sleepTime > 0.0 && sleepTime < 50.0)
+            {
+                SDL_Delay((unsigned int)sleepTime);
+            }
+        }
+        LastFrameExit = SDL_GetTicks();
+        /* Keep cumulative tracking in a sane state for any future
+         * non-pump-driven frames in the same session. */
+        resetOnce = 0;
+        return;
+    }
+    LastFrameExit = 0;
 
     // calculate frame duration based upon ROM setting (50/60hz) and mupen64plus speed adjustment
     const double VILimitMilliseconds = 1000.0 / g_dev.vi.expected_refresh_rate;
