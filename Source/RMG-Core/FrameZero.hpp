@@ -4,6 +4,7 @@
 #include "Library.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 /*
@@ -111,5 +112,15 @@ CORE_EXPORT int CoreFrameZeroModifyPlayValues(void* values, int size, int num_pl
 // Returns 0.0 when no session is active. Cheap to call; reads a single
 // float maintained by GekkoNet.
 CORE_EXPORT float CoreGetFrameZeroFramesAhead(void);
+
+// OSD notification hook. RMG-Core can't reach the OnScreenDisplay
+// directly (lives in RMG GUI), so the GUI registers a callback here and
+// the pump invokes it when something user-visible happens (rollback
+// activity, desync onset, etc.). The callback is invoked from the
+// emulation thread; the registered handler is responsible for
+// marshalling to the UI thread before touching OSD state.
+//
+// Pass an empty std::function to clear. Idempotent.
+CORE_EXPORT void CoreSetFrameZeroOSDNotifier(std::function<void(std::string)> notifier);
 
 #endif // CORE_FRAMEZERO_HPP

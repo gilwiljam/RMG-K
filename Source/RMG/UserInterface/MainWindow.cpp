@@ -36,6 +36,7 @@
 #include "Callbacks.hpp"
 #include "VidExt.hpp"
 
+#include <RMG-Core/FrameZero.hpp>
 #include <RMG-Core/FrameZeroConnect.hpp>
 
 #ifdef UPDATER
@@ -221,6 +222,10 @@ MainWindow::MainWindow() : QMainWindow(nullptr)
 
 MainWindow::~MainWindow()
 {
+    /* Drop the OSD notifier so the pump (if still running on the emu
+     * thread during teardown) doesn't try to dispatch to a destroyed
+     * MainWindow. */
+    CoreSetFrameZeroOSDNotifier(nullptr);
 }
 
 bool MainWindow::Init(QApplication* app, bool showUI, bool launchROM)
@@ -307,6 +312,17 @@ bool MainWindow::Init(QApplication* app, bool showUI, bool launchROM)
         bool fz_active = (fz_online != nullptr && fz_online[0] != '\0' && fz_online[0] != '0');
         this->ui_FrameZeroConnectPending = showUI && !launchROM && fz_active;
     }
+
+    /* Frame Zero OSD bridge. Pump runs on the emulation thread; the
+     * OSD message queue is touched from multiple threads already, but
+     * we marshal to the UI thread to stay consistent with the Kaillera
+     * chat path. The notifier is set once at startup and persists
+     * across sessions. */
+    CoreSetFrameZeroOSDNotifier([this](std::string message) {
+        QMetaObject::invokeMethod(this, [msg = std::move(message)]() mutable {
+            OnScreenDisplaySetMessage(std::move(msg));
+        }, Qt::QueuedConnection);
+    });
 
     return true;
 }
@@ -3261,27 +3277,93 @@ void MainWindow::pollFrameZeroConnectStatus(void)
          * ~32 ms RTT, clamped to [1, 4]. The OnlineArm in
          * Emulation.cpp reads FRAME_ZERO_ONLINE_DELAY at session
          * start, so overriding here before launchEmulationThread is
-         * the right hook. Unconditional — the dialog has no manual
-         * override surface. */
+         * the right hook.
+         *
+         * Two escape hatches for testing:
+         *   1. If the user pre-sets FRAME_ZERO_ONLINE_DELAY in the env,
+         *      honour it instead of overwriting. Lets us pin a specific
+         *      delay for repeatability.
+         *   2. If FRAME_ZERO_NETSIM_LATENCY_MS is set, factor it into
+         *      the measurement — netsim wraps the GekkoNet adapter but
+         *      not the handshake socket, so the raw RTT measurement
+         *      sees ~0 ms on localhost while the actual game session
+         *      sees the simulated round-trip. Without this fold-in,
+         *      every netsim test picks delay=1 regardless of latency.
+         *      Both peers' netsim contributes to RTT, but in practice
+         *      we only know our own; for symmetric testing the user
+         *      should set the same value on both sides. */
         {
-            const int rtt = CoreFrameZeroConnectGetMedianRttMs();
+            int rtt = CoreFrameZeroConnectGetMedianRttMs();
+
+            /* Account for local netsim outbound delay. Real RTT seen by
+             * GekkoNet ≈ measured_RTT + 2 × local_netsim (one outbound,
+             * one inbound from the peer's own netsim assuming symmetric
+             * test). Conservatively assume symmetric. */
+            if (const char* nsim = std::getenv("FRAME_ZERO_NETSIM_LATENCY_MS"))
+            {
+                if (nsim[0] != '\0')
+                {
+                    const int extra = std::atoi(nsim) * 2;
+                    if (extra > 0)
+                    {
+                        if (rtt < 0) rtt = 0;
+                        rtt += extra;
+                    }
+                }
+            }
+
             int delay = 2; /* fallback if measurement failed */
             if (rtt >= 0)
             {
-                delay = (rtt + 31) / 32; /* ceil(rtt/32) */
+                /* One frame of delay per ~56 ms RTT, capped at 4. The
+                 * formula is slightly more conservative than the textbook
+                 * Slippi/GGPO scale because our save/load cost is high
+                 * enough (~3 ms each) that long prediction windows turn
+                 * each rollback into a budget overrun, dragging the
+                 * local sim behind the peer. Empirically: at 180 ms RTT
+                 * delay=3 lets local fall ~1 frame behind constantly,
+                 * delay=4 stays in step.
+                 *
+                 * Scale (RTT → delay):
+                 *   ≤   56 ms → 1
+                 *   ≤  112 ms → 2
+                 *   ≤  168 ms → 3
+                 *   >  168 ms → 4 (cap; rollback covers the gap) */
+                delay = (rtt + 55) / 56;
                 if (delay < 1) delay = 1;
                 if (delay > 4) delay = 4;
             }
-            const std::string delayStr = std::to_string(delay);
+
+            /* Manual override via env var. Useful for testing a specific
+             * delay without changing the formula. */
+            int chosen = delay;
+            const char* manual = std::getenv("FRAME_ZERO_ONLINE_DELAY");
+            const bool has_manual = (manual != nullptr && manual[0] != '\0');
+            if (has_manual)
+            {
+                int m = std::atoi(manual);
+                if (m >= 0 && m <= 9) chosen = m;
+            }
+
+            const std::string delayStr = std::to_string(chosen);
 #ifdef _WIN32
             _putenv_s("FRAME_ZERO_ONLINE_DELAY", delayStr.c_str());
 #else
             setenv("FRAME_ZERO_ONLINE_DELAY", delayStr.c_str(), 1);
 #endif
-            char buf[160];
-            std::snprintf(buf, sizeof(buf),
-                "[FrameZero] auto-delay: median RTT %d ms → %d frame%s",
-                rtt, delay, delay == 1 ? "" : "s");
+            char buf[200];
+            if (has_manual && chosen != delay)
+            {
+                std::snprintf(buf, sizeof(buf),
+                    "[FrameZero] auto-delay: RTT %d ms suggests %d, manual override → %d frame%s",
+                    rtt, delay, chosen, chosen == 1 ? "" : "s");
+            }
+            else
+            {
+                std::snprintf(buf, sizeof(buf),
+                    "[FrameZero] auto-delay: RTT %d ms → %d frame%s",
+                    rtt, chosen, chosen == 1 ? "" : "s");
+            }
             CoreAddCallbackMessage(CoreDebugMessageType::Info, buf);
         }
 

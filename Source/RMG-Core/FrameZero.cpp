@@ -123,6 +123,8 @@ typedef int  (*core_wait_for_park_t)(void);
 typedef void (*core_signal_shutdown_t)(void);
 typedef void (*core_clear_shutdown_t)(void);
 typedef void (*core_set_speed_adjust_t)(double);
+typedef void (*ss_get_tlb_skip_stats_t)(uint64_t*, uint64_t*);
+typedef void (*ss_reset_tlb_skip_stats_t)(void);
 
 set_pif_sync_callback_t         g_set_pif_sync = nullptr;
 core_set_frame_zero_pump_t      g_set_pump     = nullptr;
@@ -133,6 +135,8 @@ core_wait_for_park_t            g_wait_for_park     = nullptr;
 core_signal_shutdown_t          g_signal_shutdown   = nullptr;
 core_clear_shutdown_t            g_clear_shutdown   = nullptr;
 core_set_speed_adjust_t         g_set_speed_adjust = nullptr;
+ss_get_tlb_skip_stats_t         g_get_tlb_skip_stats   = nullptr;
+ss_reset_tlb_skip_stats_t       g_reset_tlb_skip_stats = nullptr;
 bool                            g_attached     = false;
 
 /* Pump thread state. */
@@ -150,6 +154,64 @@ uint32_t                                     g_desync_last_remote     = 0;
 std::chrono::steady_clock::time_point        g_desync_first_seen{};
 bool                                         g_desync_summary_logged  = false;
 int                                          g_desync_verbose_resolved = -1;
+
+/* Verbose mode throttling: log the first kVerboseDetailLimit events in
+ * full detail (enough to characterise the initial divergence + see
+ * checksums), then emit one aggregate line per kVerboseAggregateMs to
+ * keep the log readable. Without this, every-frame DESYNC lines drown
+ * out everything else. */
+constexpr int                                kVerboseDetailLimit      = 16;
+constexpr int                                kVerboseAggregateMs      = 1000;
+int                                          g_desync_verbose_detail_count = 0;
+std::chrono::steady_clock::time_point        g_desync_verbose_last_emit{};
+int                                          g_desync_verbose_window_count = 0;
+int                                          g_desync_verbose_window_first = 0;
+
+/* OSD notifier hook. Reserved for genuinely user-actionable events
+ * (desync onset, sustained stalls, disconnects). Per-rollback
+ * notification was removed — every input change predicts wrong, which
+ * means routine play emits a constant "Rollback: N frames" stream that
+ * misleads the user about netcode health. */
+std::function<void(std::string)>             g_osd_notifier;
+
+/* Rollback budget instrumentation. Sums per-event chrono samples across
+ * a kBudgetWindowFrames-frame window, reports an aggregate line, then
+ * resets. Cannon's "4-5x sim budget" rule of thumb maps to: per-frame
+ * total < 4 ms wall-clock leaves enough headroom to absorb 4 re-sims at
+ * 60 fps. We log average + peak so a brief spike doesn't get hidden in
+ * the average. */
+constexpr int                                kBudgetWindowFrames = 60;
+int                                          g_budget_advance_count   = 0;  // forward-advance events
+int                                          g_budget_rollback_count  = 0;  // rolling-back advance events
+int                                          g_budget_save_count      = 0;
+int                                          g_budget_load_count      = 0;
+double                                       g_budget_advance_sum_us  = 0.0;
+double                                       g_budget_rollback_sum_us = 0.0;
+double                                       g_budget_save_sum_us     = 0.0;
+double                                       g_budget_load_sum_us     = 0.0;
+double                                       g_budget_advance_max_us  = 0.0;
+double                                       g_budget_rollback_max_us = 0.0;
+double                                       g_budget_save_max_us     = 0.0;
+double                                       g_budget_load_max_us     = 0.0;
+int                                          g_budget_pump_calls      = 0;
+double                                       g_budget_pump_total_us   = 0.0;
+double                                       g_budget_pump_max_us     = 0.0;
+size_t                                       g_budget_save_bytes_sum  = 0;
+size_t                                       g_budget_save_bytes_max  = 0;
+
+/* Budget log gate. Resolved once per session via FRAME_ZERO_BUDGET_LOG.
+ * Off by default — the budget summary is dev-grade telemetry, not user
+ * UX. Counters still accumulate (cheap) so flipping the env var on
+ * mid-session would still produce valid windows once it picks up. */
+bool                                         g_budget_log_enabled  = false;
+bool                                         g_budget_log_resolved = false;
+
+/* TLB LUT skip-on-load telemetry. We sample the cumulative core counters
+ * at window-start and again at window-close; the delta tells us how many
+ * loads in this window hit the fast path. Both -1 means "never sampled
+ * yet" (next budget close will initialise the baseline). */
+int64_t                                      g_tlb_skip_window_base_hits   = -1;
+int64_t                                      g_tlb_skip_window_base_misses = -1;
 
 bool ensure_state_initialised()
 {
@@ -200,6 +262,11 @@ bool fz_resolve_core_hooks()
         fz_resolve_sym(handle, "core_set_frame_zero_speed_adjust");
     /* g_set_speed_adjust is optional — old core builds without the
      * symbol still work, just without auto-stall. */
+    g_get_tlb_skip_stats = (ss_get_tlb_skip_stats_t)
+        fz_resolve_sym(handle, "savestates_get_tlb_skip_stats");
+    g_reset_tlb_skip_stats = (ss_reset_tlb_skip_stats_t)
+        fz_resolve_sym(handle, "savestates_reset_tlb_skip_stats");
+    /* TLB skip stats are optional telemetry — older cores work fine. */
 
     return (g_set_pif_sync != nullptr && g_set_pump != nullptr && g_set_rollback != nullptr &&
             g_set_pump_driven != nullptr && g_resume_emu != nullptr && g_wait_for_park != nullptr &&
@@ -439,13 +506,51 @@ static void fz_pump_one_frame(unsigned int current_frame)
 
                 if (g_desync_verbose_resolved)
                 {
-                    std::snprintf(buf, sizeof(buf),
-                        "[FrameZero] DESYNC frame=%d remote_handle=%d local_chk=0x%08x remote_chk=0x%08x",
-                        ev->data.desynced.frame,
-                        ev->data.desynced.remote_handle,
-                        ev->data.desynced.local_checksum,
-                        ev->data.desynced.remote_checksum);
-                    CoreAddCallbackMessage(CoreDebugMessageType::Error, buf);
+                    /* First N events: full per-frame detail. */
+                    if (g_desync_verbose_detail_count < kVerboseDetailLimit)
+                    {
+                        std::snprintf(buf, sizeof(buf),
+                            "[FrameZero] DESYNC frame=%d remote_handle=%d local_chk=0x%08x remote_chk=0x%08x",
+                            ev->data.desynced.frame,
+                            ev->data.desynced.remote_handle,
+                            ev->data.desynced.local_checksum,
+                            ev->data.desynced.remote_checksum);
+                        CoreAddCallbackMessage(CoreDebugMessageType::Error, buf);
+                        ++g_desync_verbose_detail_count;
+                        if (g_desync_verbose_detail_count == kVerboseDetailLimit)
+                        {
+                            CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                                "[FrameZero] verbose desync detail cap reached — switching to "
+                                "1Hz aggregate. Unset FRAME_ZERO_VERBOSE_DESYNC for one-shot summary mode.");
+                            g_desync_verbose_last_emit  = std::chrono::steady_clock::now();
+                            g_desync_verbose_window_count = 0;
+                            g_desync_verbose_window_first = ev->data.desynced.frame + 1;
+                        }
+                        break;
+                    }
+
+                    /* After the detail cap: 1Hz aggregate. */
+                    if (g_desync_verbose_window_count == 0)
+                        g_desync_verbose_window_first = ev->data.desynced.frame;
+                    ++g_desync_verbose_window_count;
+
+                    const auto vnow = std::chrono::steady_clock::now();
+                    const auto velapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              vnow - g_desync_verbose_last_emit).count();
+                    if (velapsed >= kVerboseAggregateMs)
+                    {
+                        std::snprintf(buf, sizeof(buf),
+                            "[FrameZero] DESYNC ×%d frames=[%d..%d] last local=0x%08x remote=0x%08x",
+                            g_desync_verbose_window_count,
+                            g_desync_verbose_window_first,
+                            ev->data.desynced.frame,
+                            ev->data.desynced.local_checksum,
+                            ev->data.desynced.remote_checksum);
+                        CoreAddCallbackMessage(CoreDebugMessageType::Error, buf);
+                        g_desync_verbose_last_emit    = vnow;
+                        g_desync_verbose_window_count = 0;
+                        g_desync_verbose_window_first = ev->data.desynced.frame + 1;
+                    }
                     break;
                 }
 
@@ -518,6 +623,12 @@ static void fz_pump_one_frame(unsigned int current_frame)
     int first_save_frame = -1, first_load_frame = -1;
     int first_adv_frame = -1, last_adv_frame = -1;
 
+    /* Pump call timing for budget reporting. Each event handler below
+     * adds its own chrono delta into the per-window accumulators; we
+     * also wrap the entire pump call so we know the wall-clock cost
+     * relative to the 16.67 ms/frame budget. */
+    const auto pump_t0 = std::chrono::steady_clock::now();
+
     count = 0;
     GekkoGameEvent** updates = gekko_update_session(g_session, &count);
     for (int i = 0; i < count; ++i)
@@ -530,13 +641,25 @@ static void fz_pump_one_frame(unsigned int current_frame)
         {
             case GekkoSaveEvent:
             {
+                const auto save_t0 = std::chrono::steady_clock::now();
                 if (n_save == 0) first_save_frame = ev->data.save.frame;
                 ++n_save;
                 size_t written = 0;
                 const size_t snap = FrameZero::stateSnapshotSize();
                 if (snap == 0 || ev->data.save.state == nullptr)
+                {
+                    /* Still record the (cheap) early-out time so the
+                     * budget tally counts every save event. */
+                    const auto save_t1 = std::chrono::steady_clock::now();
+                    const double us = std::chrono::duration<double, std::micro>(
+                                          save_t1 - save_t0).count();
+                    g_budget_save_sum_us += us;
+                    if (us > g_budget_save_max_us) g_budget_save_max_us = us;
+                    ++g_budget_save_count;
                     break;
-                if (FrameZero::captureToBuffer(ev->data.save.state, snap, &written))
+                }
+                if (FrameZero::captureToBuffer(ev->data.save.state, snap, &written,
+                                               ev->data.save.frame))
                 {
                     if (ev->data.save.state_len != nullptr)
                         *ev->data.save.state_len = (unsigned int)written;
@@ -586,6 +709,17 @@ static void fz_pump_one_frame(unsigned int current_frame)
                     }
                     if (s_chunk_dbg_remaining > 0)
                     {
+                        auto fnv32 = [](const uint8_t* p, size_t n) {
+                            uint32_t h = 2166136261u;
+                            for (size_t b = 0; b < n; ++b)
+                            {
+                                h ^= p[b];
+                                h *= 16777619u;
+                            }
+                            return h;
+                        };
+
+                        /* Coarse 16-chunk pass — first level of localisation. */
                         constexpr int kChunks = 16;
                         const size_t chunk = (written + kChunks - 1) / kChunks;
                         char line[512];
@@ -597,30 +731,140 @@ static void fz_pump_one_frame(unsigned int current_frame)
                             size_t s = c * chunk;
                             size_t e2 = s + chunk;
                             if (e2 > written) e2 = written;
-                            uint32_t ch = 2166136261u;
-                            for (size_t b = s; b < e2; ++b)
-                            {
-                                ch ^= ev->data.save.state[b];
-                                ch *= 16777619u;
-                            }
                             off += std::snprintf(line + off, sizeof(line) - off,
-                                                 " %08x", ch);
+                                                 " %08x",
+                                                 fnv32(ev->data.save.state + s, e2 - s));
                         }
                         CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(line));
+
+                        /* Fine pass over the LAST coarse chunk (chunk 15 in the
+                         * 16-chunk scheme). Cross-instance diff has shown the
+                         * divergence is confined to the trailer region, so
+                         * subdivide just that ~1 MB into 32 sub-chunks for
+                         * ~33 KB resolution. Two A/B runs at this resolution
+                         * localise the divergent bytes to a single tail-region
+                         * field (event queue / data_0001_0200 / RSP plugin
+                         * trailer). */
+                        constexpr int kFineChunks = 32;
+                        const size_t tail_start = (size_t)(kChunks - 1) * chunk;
+                        if (tail_start < written)
+                        {
+                            const size_t tail_len = written - tail_start;
+                            const size_t fine = (tail_len + kFineChunks - 1) / kFineChunks;
+                            char fline[1024];
+                            int foff = std::snprintf(fline, sizeof(fline),
+                                "[FrameZero save-chunk15-fine] frame=%d off=%zu len=%zu :",
+                                ev->data.save.frame, tail_start, tail_len);
+                            for (int c = 0; c < kFineChunks && foff < (int)sizeof(fline) - 16; ++c)
+                            {
+                                size_t s = tail_start + (size_t)c * fine;
+                                size_t e2 = s + fine;
+                                if (e2 > written) e2 = written;
+                                if (s >= e2) break;
+                                foff += std::snprintf(fline + foff, sizeof(fline) - foff,
+                                                     " %08x",
+                                                     fnv32(ev->data.save.state + s, e2 - s));
+                            }
+                            CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(fline));
+                        }
+
+                        /* Named-regions pass — emits one hash per known
+                         * structural section of the savestate trailer. The
+                         * fine pass above showed the divergence sits in the
+                         * last ~33 KB, but that window overlaps four distinct
+                         * regions (end-of-body, queue, data_0001_0200, RSP1
+                         * trailer). Hashing each region separately lets us
+                         * identify which field is host-dependent in one A/B
+                         * run without another power-of-2 subdivision.
+                         *
+                         * Offsets are mupen64plus savestate-format constants:
+                         *   queue:           16,788,288 .. +1024
+                         *   using_tlb:       16,789,312 .. +4
+                         *   data_0001_0200:  16,789,316 .. +4096
+                         *   RSP1 trailer:    16,793,412 .. end
+                         * The body extends from 0 to 16,788,288. Anything
+                         * past 16,793,412 is the RSP plugin state. */
+                        auto emit_region = [&](char* dst, int& dst_off, size_t cap,
+                                               const char* name, size_t off, size_t len)
+                        {
+                            if (off >= written) return;
+                            if (off + len > written) len = written - off;
+                            uint32_t h = fnv32(ev->data.save.state + off, len);
+                            dst_off += std::snprintf(dst + dst_off, cap - dst_off,
+                                                     " %s=%08x", name, h);
+                        };
+
+                        char rline[512];
+                        int roff = std::snprintf(rline, sizeof(rline),
+                            "[FrameZero save-regions] frame=%d :",
+                            ev->data.save.frame);
+
+                        constexpr size_t kQueueOff   = 16788288u;
+                        constexpr size_t kQueueLen   = 1024u;
+                        constexpr size_t kUTlbOff    = kQueueOff + kQueueLen;
+                        constexpr size_t kUTlbLen    = 4u;
+                        constexpr size_t kData02Off  = kUTlbOff + kUTlbLen;
+                        constexpr size_t kData02Len  = 4096u;
+                        constexpr size_t kRsp1Off    = kData02Off + kData02Len;
+
+                        /* End-of-body covers the last 64 KB of the fixed
+                         * body — TLB, FPU/GPR, controllers, transferpaks,
+                         * PIF channel offsets, DD state, SP fifo, flashram,
+                         * AI fifo, cp0 latches. Most of these are zero-pad
+                         * but any one of them could be the diverger. */
+                        constexpr size_t kBodyTailOff = 16788288u - 65536u;
+                        constexpr size_t kBodyTailLen = 65536u;
+
+                        emit_region(rline, roff, sizeof(rline), "body_tail64k", kBodyTailOff, kBodyTailLen);
+                        emit_region(rline, roff, sizeof(rline), "queue",        kQueueOff,    kQueueLen);
+                        emit_region(rline, roff, sizeof(rline), "using_tlb",    kUTlbOff,     kUTlbLen);
+                        emit_region(rline, roff, sizeof(rline), "data_0001_0200", kData02Off, kData02Len);
+                        if (kRsp1Off < written)
+                            emit_region(rline, roff, sizeof(rline), "rsp1_trailer", kRsp1Off, written - kRsp1Off);
+
+                        CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(rline));
+
                         --s_chunk_dbg_remaining;
                     }
+                }
+                {
+                    const auto save_t1 = std::chrono::steady_clock::now();
+                    const double us = std::chrono::duration<double, std::micro>(
+                                          save_t1 - save_t0).count();
+                    g_budget_save_sum_us += us;
+                    if (us > g_budget_save_max_us) g_budget_save_max_us = us;
+                    g_budget_save_bytes_sum += written;
+                    if (written > g_budget_save_bytes_max) g_budget_save_bytes_max = written;
+                    ++g_budget_save_count;
                 }
                 break;
             }
             case GekkoLoadEvent:
             {
+                const auto load_t0 = std::chrono::steady_clock::now();
                 if (n_load == 0) first_load_frame = ev->data.load.frame;
                 ++n_load;
                 if (ev->data.load.state == nullptr || ev->data.load.state_len == 0)
+                {
+                    const auto load_t1 = std::chrono::steady_clock::now();
+                    const double us = std::chrono::duration<double, std::micro>(
+                                          load_t1 - load_t0).count();
+                    g_budget_load_sum_us += us;
+                    if (us > g_budget_load_max_us) g_budget_load_max_us = us;
+                    ++g_budget_load_count;
                     break;
+                }
                 FrameZero::restoreFromBuffer(ev->data.load.state,
                                              ev->data.load.state_len);
                 saw_load = true;
+                {
+                    const auto load_t1 = std::chrono::steady_clock::now();
+                    const double us = std::chrono::duration<double, std::micro>(
+                                          load_t1 - load_t0).count();
+                    g_budget_load_sum_us += us;
+                    if (us > g_budget_load_max_us) g_budget_load_max_us = us;
+                    ++g_budget_load_count;
+                }
                 break;
             }
             case GekkoAdvanceEvent:
@@ -660,11 +904,30 @@ static void fz_pump_one_frame(unsigned int current_frame)
                  * g_synced_inputs and fed them into PIF channels
                  * during the run. */
                 fz_set_rollback(ev->data.adv.rolling_back ? 1 : 0);
+                const bool   adv_rolling = ev->data.adv.rolling_back;
+                const auto   adv_t0      = std::chrono::steady_clock::now();
                 if (g_resume_emu) g_resume_emu();
                 if (g_wait_for_park)
                 {
                     if (!g_wait_for_park())
                     {
+                        /* Record the partial timing so the budget log
+                         * doesn't get a hole on shutdown frame. */
+                        const auto adv_t1 = std::chrono::steady_clock::now();
+                        const double us = std::chrono::duration<double, std::micro>(
+                                              adv_t1 - adv_t0).count();
+                        if (adv_rolling)
+                        {
+                            g_budget_rollback_sum_us += us;
+                            if (us > g_budget_rollback_max_us) g_budget_rollback_max_us = us;
+                            ++g_budget_rollback_count;
+                        }
+                        else
+                        {
+                            g_budget_advance_sum_us += us;
+                            if (us > g_budget_advance_max_us) g_budget_advance_max_us = us;
+                            ++g_budget_advance_count;
+                        }
                         /* Shutdown signalled mid-event. Bail to caller
                          * which will exit the thread loop. */
                         if (log_this_call)
@@ -673,6 +936,23 @@ static void fz_pump_one_frame(unsigned int current_frame)
                                 "[FrameZero pump] shutdown during AdvanceEvent — exiting");
                         }
                         return;
+                    }
+                }
+                {
+                    const auto adv_t1 = std::chrono::steady_clock::now();
+                    const double us = std::chrono::duration<double, std::micro>(
+                                          adv_t1 - adv_t0).count();
+                    if (adv_rolling)
+                    {
+                        g_budget_rollback_sum_us += us;
+                        if (us > g_budget_rollback_max_us) g_budget_rollback_max_us = us;
+                        ++g_budget_rollback_count;
+                    }
+                    else
+                    {
+                        g_budget_advance_sum_us += us;
+                        if (us > g_budget_advance_max_us) g_budget_advance_max_us = us;
+                        ++g_budget_advance_count;
                     }
                 }
                 /* Reset PIF gate for the freshly-parked frame so its
@@ -711,36 +991,43 @@ static void fz_pump_one_frame(unsigned int current_frame)
      * visible in the log even after the limiter clamps it. */
     if (g_mode == CoreFrameZero::SessionMode::Online && n_advance > 0)
     {
+        /* Proportional brake with a 1-frame deadzone.
+         *
+         * Earlier iteration: brake fired the moment ahead > 0.0 with no
+         * deadzone. That eliminated a previous oscillation bug (a 0.5-
+         * frame on/off threshold opened and closed the brake every
+         * ~second on jittery links) but introduced low-grade chatter on
+         * clean LANs where natural skew oscillates between ±0.5 — the
+         * brake fired constantly at sub-1 % strength, slowing the local
+         * sim for no real benefit and producing noisy pacing logs.
+         *
+         * Current shape: zero adjust until ahead > 1.0, then a smooth
+         * proportional ramp from 0 (so the brake doesn't jump to 1 % at
+         * the threshold), capped at +2.5 %. The deadzone is small
+         * enough that a real high-skew situation (one peer ~300 ms RTT)
+         * still ends up at the cap, but normal play doesn't trigger it. */
+        constexpr float kBrakeDeadzone = 1.0f;
         const float ahead = gekko_frames_ahead(g_session);
         double adjust = 1.0;
-        if (ahead > 0.0f)
+        if (ahead > kBrakeDeadzone)
         {
-            /* Proportional brake. Linear in `ahead` rather than the
-             * earlier 0.5-frame deadzone, which oscillated: skew >0.5
-             * fired the brake, brake closed gap to ~0.4, brake released,
-             * rollback overhead pushed back over 0.5, repeat. With a
-             * proportional signal the brake stays partially engaged at
-             * any positive skew so the gap doesn't re-open. Slope 1 %
-             * per frame ahead, capped at +2.5 % so we don't lurch the
-             * sim if a short measurement spike hits. */
-            adjust = 1.0 + std::min(0.025, 0.01 * (double)ahead);
+            adjust = 1.0 + std::min(0.025, 0.01 * (double)(ahead - kBrakeDeadzone));
         }
         if (g_set_speed_adjust != nullptr) g_set_speed_adjust(adjust);
 
-        if ((g_pump_call_count % 300) == 0 && (ahead > 0.5f || ahead < -0.5f))
+        if ((g_pump_call_count % 300) == 0 &&
+            (ahead > kBrakeDeadzone || ahead < -kBrakeDeadzone))
         {
             char buf[200];
-            const double pct = (adjust - 1.0) * 100.0;
-            std::snprintf(buf, sizeof(buf),
-                "[FrameZero pacing] frame=%d frames_ahead=%+.2f (%s%s%.2f%%)",
-                last_adv_frame, ahead,
-                ahead > 0.0f ? "local is ahead" : "local is behind",
-                ahead > 0.0f ? ", slowing " : "",
-                pct);
-            if (ahead <= 0.0f)
+            if (ahead > kBrakeDeadzone)
             {
-                /* Recompute the message so we don't emit a stale "slowing
-                 * 0%" tail when behind. */
+                const double pct = (adjust - 1.0) * 100.0;
+                std::snprintf(buf, sizeof(buf),
+                    "[FrameZero pacing] frame=%d frames_ahead=%+.2f (local is ahead, slowing %.2f%%)",
+                    last_adv_frame, ahead, pct);
+            }
+            else
+            {
                 std::snprintf(buf, sizeof(buf),
                     "[FrameZero pacing] frame=%d frames_ahead=%+.2f (local is behind)",
                     last_adv_frame, ahead);
@@ -756,6 +1043,136 @@ static void fz_pump_one_frame(unsigned int current_frame)
     if (saw_load && !saw_advance)
     {
         fz_set_rollback(1);
+    }
+
+    /* Pump-call total. Records wall-clock cost of one pump iteration so
+     * we can flag when a single pump call eats most of a frame's
+     * 16.67 ms budget. */
+    {
+        const auto pump_t1 = std::chrono::steady_clock::now();
+        const double us = std::chrono::duration<double, std::micro>(
+                              pump_t1 - pump_t0).count();
+        g_budget_pump_total_us += us;
+        if (us > g_budget_pump_max_us) g_budget_pump_max_us = us;
+        ++g_budget_pump_calls;
+    }
+
+    /* Rolling budget report. Once the window fills, optionally emit one
+     * summary line and reset accumulators. The window is in pump calls,
+     * which roughly correspond to forward-advance frames, so a 60-call
+     * window is ~1 second of real time at 60 fps. The summary line is
+     * dev-grade telemetry — gated on FRAME_ZERO_BUDGET_LOG so the log
+     * file isn't noisy during normal play. Counters always reset so we
+     * don't accumulate unbounded state. */
+    if (g_budget_pump_calls >= kBudgetWindowFrames)
+    {
+        if (!g_budget_log_resolved)
+        {
+            const char* env = std::getenv("FRAME_ZERO_BUDGET_LOG");
+            g_budget_log_enabled = (env != nullptr && env[0] != '\0' && env[0] != '0');
+            g_budget_log_resolved = true;
+        }
+
+        const double avg_pump   = g_budget_pump_total_us   / std::max(1, g_budget_pump_calls);
+        const double avg_save   = g_budget_save_count   ? g_budget_save_sum_us     / g_budget_save_count   : 0.0;
+        const double avg_load   = g_budget_load_count   ? g_budget_load_sum_us     / g_budget_load_count   : 0.0;
+        const double avg_adv    = g_budget_advance_count ? g_budget_advance_sum_us  / g_budget_advance_count : 0.0;
+        const double avg_rb     = g_budget_rollback_count ? g_budget_rollback_sum_us / g_budget_rollback_count : 0.0;
+        const double pump_pct   = (avg_pump / 16670.0) * 100.0;
+
+        const double avg_save_kb = g_budget_save_count
+            ? (double)g_budget_save_bytes_sum / (double)g_budget_save_count / 1024.0
+            : 0.0;
+        const double max_save_kb = (double)g_budget_save_bytes_max / 1024.0;
+
+        /* Sample TLB skip stats and compute delta vs window start. */
+        int64_t tlb_window_hits   = 0;
+        int64_t tlb_window_misses = 0;
+        bool    tlb_have_window   = false;
+        if (g_get_tlb_skip_stats != nullptr)
+        {
+            uint64_t cur_hits = 0, cur_misses = 0;
+            g_get_tlb_skip_stats(&cur_hits, &cur_misses);
+            if (g_tlb_skip_window_base_hits < 0)
+            {
+                /* First window after attach — establish baseline; the
+                 * very first window won't print TLB stats. */
+                g_tlb_skip_window_base_hits   = (int64_t)cur_hits;
+                g_tlb_skip_window_base_misses = (int64_t)cur_misses;
+            }
+            else
+            {
+                tlb_window_hits   = (int64_t)cur_hits   - g_tlb_skip_window_base_hits;
+                tlb_window_misses = (int64_t)cur_misses - g_tlb_skip_window_base_misses;
+                if (tlb_window_hits < 0) tlb_window_hits = 0;
+                if (tlb_window_misses < 0) tlb_window_misses = 0;
+                tlb_have_window = (tlb_window_hits + tlb_window_misses) > 0;
+                g_tlb_skip_window_base_hits   = (int64_t)cur_hits;
+                g_tlb_skip_window_base_misses = (int64_t)cur_misses;
+            }
+        }
+
+        if (g_budget_log_enabled)
+        {
+            char buf[560];
+            if (tlb_have_window)
+            {
+                const int64_t total = tlb_window_hits + tlb_window_misses;
+                const double  pct   = (double)tlb_window_hits / (double)total * 100.0;
+                std::snprintf(buf, sizeof(buf),
+                    "[FrameZero budget] %d calls — pump avg=%.2fms peak=%.2fms (%.0f%% of 16.67ms) | "
+                    "save n=%d avg=%.2fms peak=%.2fms size avg=%.0fKB peak=%.0fKB | "
+                    "load n=%d avg=%.2fms peak=%.2fms | "
+                    "adv n=%d avg=%.2fms peak=%.2fms | rb n=%d avg=%.2fms peak=%.2fms | "
+                    "tlb_skip hit=%lld miss=%lld (%.0f%%)",
+                    g_budget_pump_calls, avg_pump / 1000.0, g_budget_pump_max_us / 1000.0, pump_pct,
+                    g_budget_save_count,     avg_save / 1000.0, g_budget_save_max_us / 1000.0,
+                    avg_save_kb, max_save_kb,
+                    g_budget_load_count,     avg_load / 1000.0, g_budget_load_max_us / 1000.0,
+                    g_budget_advance_count,  avg_adv  / 1000.0, g_budget_advance_max_us / 1000.0,
+                    g_budget_rollback_count, avg_rb   / 1000.0, g_budget_rollback_max_us / 1000.0,
+                    (long long)tlb_window_hits, (long long)tlb_window_misses, pct);
+            }
+            else
+            {
+                std::snprintf(buf, sizeof(buf),
+                    "[FrameZero budget] %d calls — pump avg=%.2fms peak=%.2fms (%.0f%% of 16.67ms) | "
+                    "save n=%d avg=%.2fms peak=%.2fms size avg=%.0fKB peak=%.0fKB | "
+                    "load n=%d avg=%.2fms peak=%.2fms | "
+                    "adv n=%d avg=%.2fms peak=%.2fms | rb n=%d avg=%.2fms peak=%.2fms",
+                    g_budget_pump_calls, avg_pump / 1000.0, g_budget_pump_max_us / 1000.0, pump_pct,
+                    g_budget_save_count,     avg_save / 1000.0, g_budget_save_max_us / 1000.0,
+                    avg_save_kb, max_save_kb,
+                    g_budget_load_count,     avg_load / 1000.0, g_budget_load_max_us / 1000.0,
+                    g_budget_advance_count,  avg_adv  / 1000.0, g_budget_advance_max_us / 1000.0,
+                    g_budget_rollback_count, avg_rb   / 1000.0, g_budget_rollback_max_us / 1000.0);
+            }
+            CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(buf));
+        }
+        else
+        {
+            (void)avg_pump; (void)avg_save; (void)avg_load; (void)avg_adv; (void)avg_rb;
+            (void)pump_pct; (void)avg_save_kb; (void)max_save_kb;
+            (void)tlb_have_window; (void)tlb_window_hits; (void)tlb_window_misses;
+        }
+
+        g_budget_pump_calls       = 0;
+        g_budget_pump_total_us    = 0.0;
+        g_budget_pump_max_us      = 0.0;
+        g_budget_save_count       = 0;
+        g_budget_save_sum_us      = 0.0;
+        g_budget_save_max_us      = 0.0;
+        g_budget_save_bytes_sum   = 0;
+        g_budget_save_bytes_max   = 0;
+        g_budget_load_count       = 0;
+        g_budget_load_sum_us      = 0.0;
+        g_budget_load_max_us      = 0.0;
+        g_budget_advance_count    = 0;
+        g_budget_advance_sum_us   = 0.0;
+        g_budget_advance_max_us   = 0.0;
+        g_budget_rollback_count   = 0;
+        g_budget_rollback_sum_us  = 0.0;
+        g_budget_rollback_max_us  = 0.0;
     }
 }
 
@@ -953,6 +1370,11 @@ bool CoreStartFrameZeroStressSession(int num_players)
     fz_set_rollback(0);
     g_attached = true;
 
+    if (g_reset_tlb_skip_stats != nullptr) g_reset_tlb_skip_stats();
+    g_tlb_skip_window_base_hits   = -1;
+    g_tlb_skip_window_base_misses = -1;
+    g_budget_log_resolved = false;
+
     /* Spin up the pump thread + park-driven mode. Clear any stale
      * shutdown flag from a prior session. Set pump_driven AFTER
      * thread is launched so the emulation thread sees pump_driven=1
@@ -1076,6 +1498,14 @@ bool CoreStartFrameZeroOnlineSession(int num_players,
         }
     }
 
+    /* Run-ahead is intentionally OFF (default 0). For an N64 emulator
+     * with ~3 ms save + ~3 ms load on a 16 MB savestate, runahead=1
+     * doubles per-frame cost because it forces a save+load+re-sim every
+     * frame whether or not the network mispredicted. Our budget can't
+     * absorb that. Slippi can run runahead=1+ because Melee state is
+     * tiny on Dolphin (sub-millisecond save). Leave at 0 and let
+     * rollback do its work only when actually needed. */
+
     g_mode = CoreFrameZero::SessionMode::Online;
     g_num_players = num_players;
 
@@ -1101,6 +1531,11 @@ bool CoreStartFrameZeroOnlineSession(int num_players,
     g_set_pump(nullptr);
     fz_set_rollback(0);
     g_attached = true;
+
+    if (g_reset_tlb_skip_stats != nullptr) g_reset_tlb_skip_stats();
+    g_tlb_skip_window_base_hits   = -1;
+    g_tlb_skip_window_base_misses = -1;
+    g_budget_log_resolved = false;
 
     g_clear_shutdown();
     g_pump_running.store(true, std::memory_order_release);
@@ -1181,8 +1616,31 @@ bool CoreEndFrameZeroSession(void)
     /* Reset the desync-log accumulator so the next session starts
      * fresh. Verbose flag deliberately preserved across sessions
      * since it's an env-var read once. */
-    g_desync_count          = 0;
-    g_desync_summary_logged = false;
+    g_desync_count                = 0;
+    g_desync_summary_logged       = false;
+    g_desync_verbose_detail_count = 0;
+    g_desync_verbose_window_count = 0;
+    g_desync_verbose_window_first = 0;
+
+    /* Reset budget instrumentation. Next session starts with empty
+     * windows so we don't print stale aggregates from the prior run. */
+    g_budget_pump_calls       = 0;
+    g_budget_pump_total_us    = 0.0;
+    g_budget_pump_max_us      = 0.0;
+    g_budget_save_count       = 0;
+    g_budget_save_sum_us      = 0.0;
+    g_budget_save_max_us      = 0.0;
+    g_budget_save_bytes_sum   = 0;
+    g_budget_save_bytes_max   = 0;
+    g_budget_load_count       = 0;
+    g_budget_load_sum_us      = 0.0;
+    g_budget_load_max_us      = 0.0;
+    g_budget_advance_count    = 0;
+    g_budget_advance_sum_us   = 0.0;
+    g_budget_advance_max_us   = 0.0;
+    g_budget_rollback_count   = 0;
+    g_budget_rollback_sum_us  = 0.0;
+    g_budget_rollback_max_us  = 0.0;
     return true;
 #else
     return false;
@@ -1218,5 +1676,14 @@ float CoreGetFrameZeroFramesAhead(void)
     return gekko_frames_ahead(g_session);
 #else
     return 0.0f;
+#endif
+}
+
+void CoreSetFrameZeroOSDNotifier(std::function<void(std::string)> notifier)
+{
+#ifdef FRAME_ZERO
+    g_osd_notifier = std::move(notifier);
+#else
+    (void)notifier;
 #endif
 }
